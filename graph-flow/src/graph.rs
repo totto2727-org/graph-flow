@@ -1,5 +1,6 @@
 use dashmap::DashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -25,9 +26,15 @@ pub struct Edge {
 pub struct Graph {
     pub id: String,
     tasks: DashMap<String, Arc<dyn Task>>,
-    edges: Mutex<Vec<Edge>>,
+    /// Outgoing edges indexed by source task id. Within a bucket, edges keep
+    /// insertion order so the first matching conditional edge (or the first
+    /// unconditional fallback) wins deterministically.
+    edges: DashMap<String, Vec<Edge>>,
     start_task_id: Mutex<Option<String>>,
     task_timeout: Duration,
+    /// Maximum number of chained `ContinueAndExecute` steps allowed within a
+    /// single `execute_session` call. `None` (default) means unlimited.
+    max_execution_steps: Option<usize>,
 }
 
 impl Graph {
@@ -35,15 +42,23 @@ impl Graph {
         Self {
             id: id.into(),
             tasks: DashMap::new(),
-            edges: Mutex::new(Vec::new()),
+            edges: DashMap::new(),
             start_task_id: Mutex::new(None),
             task_timeout: Duration::from_secs(300), // Default 5 minute timeout
+            max_execution_steps: None,
         }
     }
-    
+
     /// Set the timeout duration for task execution
     pub fn set_task_timeout(&mut self, timeout: Duration) {
         self.task_timeout = timeout;
+    }
+
+    /// Set the maximum number of chained `ContinueAndExecute` steps allowed
+    /// within a single `execute_session` call. Guards against accidental
+    /// infinite loops in cyclic graphs. `None` means unlimited.
+    pub fn set_max_execution_steps(&mut self, max: Option<usize>) {
+        self.max_execution_steps = max;
     }
 
     /// Add a task to the graph
@@ -60,19 +75,28 @@ impl Graph {
         self
     }
 
-    /// Set the starting task
+    /// Set the starting task.
+    ///
+    /// Logs a warning and leaves the current start task unchanged if the
+    /// given task id has not been added to the graph.
     pub fn set_start_task(&self, task_id: impl Into<String>) -> &Self {
         let task_id = task_id.into();
         if self.tasks.contains_key(&task_id) {
             *self.start_task_id.lock().unwrap() = Some(task_id);
+        } else {
+            tracing::warn!(
+                task_id = %task_id,
+                "set_start_task called with unknown task id - start task unchanged"
+            );
         }
         self
     }
 
     /// Add an edge between tasks
     pub fn add_edge(&self, from: impl Into<String>, to: impl Into<String>) -> &Self {
-        self.edges.lock().unwrap().push(Edge {
-            from: from.into(),
+        let from = from.into();
+        self.edges.entry(from.clone()).or_default().push(Edge {
+            from,
             to: to.into(),
             condition: None,
         });
@@ -92,32 +116,39 @@ impl Graph {
         F: Fn(&Context) -> bool + Send + Sync + 'static,
     {
         let from = from.into();
-        let yes_to = yes.into();
-        let no_to = no.into();
-
         let predicate: EdgeCondition = Arc::new(condition);
 
-        let mut edges = self.edges.lock().unwrap();
+        let mut bucket = self.edges.entry(from.clone()).or_default();
 
         // "yes" branch
-        edges.push(Edge {
+        bucket.push(Edge {
             from: from.clone(),
-            to: yes_to,
+            to: yes.into(),
             condition: Some(predicate),
         });
 
         // "else" branch (unconditional fallback)
-        edges.push(Edge {
+        bucket.push(Edge {
             from,
-            to: no_to,
+            to: no.into(),
             condition: None,
         });
 
         self
     }
 
-    /// Execute the graph with session management
-    /// This method manages the session state and returns a simple status
+    /// Execute the graph with session management.
+    ///
+    /// Runs the session's current task. If the task returns
+    /// [`NextAction::ContinueAndExecute`], execution proceeds to the next task
+    /// within the same call, repeating until a task pauses, waits for input,
+    /// ends, or the configured `max_execution_steps` limit is hit.
+    ///
+    /// Note: the session is only persisted by the *caller* (e.g.
+    /// [`crate::FlowRunner::run`]) after this method returns, so context
+    /// updates made by intermediate `ContinueAndExecute` steps are not durable
+    /// until the whole chain finishes.
+    #[allow(deprecated)] // NextAction::GoBack must still be matched until removed
     pub async fn execute_session(&self, session: &mut Session) -> Result<ExecutionResult> {
         tracing::info!(
             graph_id = %self.id,
@@ -125,108 +156,93 @@ impl Graph {
             current_task = %session.current_task_id,
             "Starting graph execution"
         );
-        
-        // Execute ONLY the current task (not the full recursive chain)
-        let result = self
-            .execute_single_task(&session.current_task_id, session.context.clone())
-            .await?;
 
-        // Handle next action at the session level
-        match &result.next_action {
-            NextAction::Continue => {
-                // Update session status message if provided
-                session.status_message = result.status_message.clone();
+        let mut steps = 0usize;
 
-                // Find the next task but don't execute it
-                if let Some(next_task_id) = self.find_next_task(&result.task_id, &session.context) {
+        loop {
+            let result = self
+                .execute_single_task(&session.current_task_id, session.context.clone())
+                .await?;
+
+            // Update session status message if provided
+            session.status_message = result.status_message.clone();
+
+            match &result.next_action {
+                NextAction::Continue | NextAction::ContinueAndExecute => {
+                    let Some(next_task_id) = self.find_next_task(&result.task_id, &session.context)
+                    else {
+                        // No outgoing edge found, stay at current task
+                        session.current_task_id = result.task_id.clone();
+                        return Ok(ExecutionResult {
+                            response: result.response,
+                            status: ExecutionStatus::Paused {
+                                next_task_id: result.task_id.clone(),
+                                reason: "No outgoing edge found from current task".to_string(),
+                            },
+                        });
+                    };
+
                     session.current_task_id = next_task_id.clone();
-                    Ok(ExecutionResult {
+
+                    if result.next_action == NextAction::ContinueAndExecute {
+                        steps += 1;
+                        if let Some(max) = self.max_execution_steps
+                            && steps >= max
+                        {
+                            return Err(GraphError::TaskExecutionFailed(format!(
+                                "Aborted after {} chained ContinueAndExecute steps \
+                                 (max_execution_steps = {}). Possible cycle in graph '{}'",
+                                steps, max, self.id
+                            )));
+                        }
+                        // Execute the next task immediately within this call
+                        continue;
+                    }
+
+                    return Ok(ExecutionResult {
                         response: result.response,
-                        status: ExecutionStatus::Paused { 
+                        status: ExecutionStatus::Paused {
                             next_task_id,
                             reason: "Task completed, continuing to next task".to_string(),
                         },
-                    })
-                } else {
-                    // No next task found, stay at current task
-                    session.current_task_id = result.task_id.clone();
-                    Ok(ExecutionResult {
-                        response: result.response,
-                        status: ExecutionStatus::Paused { 
-                            next_task_id: result.task_id.clone(),
-                            reason: "No outgoing edge found from current task".to_string(),
-                        },
-                    })
+                    });
                 }
-            }
-            NextAction::ContinueAndExecute => {
-                // Update session status message if provided
-                session.status_message = result.status_message.clone();
-
-                // Find the next task and execute it immediately (recursive behavior)
-                if let Some(next_task_id) = self.find_next_task(&result.task_id, &session.context) {
-                    // Instead of using the old execute method that clones context,
-                    // continue executing in session mode to preserve context updates
-                    session.current_task_id = next_task_id;
-
-                    // Recursively call execute_session to maintain proper context sharing
-                    return Box::pin(self.execute_session(session)).await;
-                } else {
-                    // No next task found, stay at current task
+                NextAction::WaitForInput => {
+                    // Stay at the current task
                     session.current_task_id = result.task_id.clone();
-                    Ok(ExecutionResult {
+                    return Ok(ExecutionResult {
                         response: result.response,
-                        status: ExecutionStatus::Paused { 
-                            next_task_id: result.task_id.clone(),
-                            reason: "No outgoing edge found from current task".to_string(),
-                        },
-                    })
+                        status: ExecutionStatus::WaitingForInput,
+                    });
                 }
-            }
-            NextAction::WaitForInput => {
-                // Update session status message if provided
-                session.status_message = result.status_message.clone();
-                // Stay at the current task
-                session.current_task_id = result.task_id.clone();
-                Ok(ExecutionResult {
-                    response: result.response,
-                    status: ExecutionStatus::WaitingForInput,
-                })
-            }
-            NextAction::End => {
-                // Update session status message if provided
-                session.status_message = result.status_message.clone();
-                session.current_task_id = result.task_id.clone();
-                Ok(ExecutionResult {
-                    response: result.response,
-                    status: ExecutionStatus::Completed,
-                })
-            }
-            NextAction::GoTo(target_id) => {
-                // Update session status message if provided
-                session.status_message = result.status_message.clone();
-                if self.tasks.contains_key(target_id) {
+                NextAction::End => {
+                    session.current_task_id = result.task_id.clone();
+                    return Ok(ExecutionResult {
+                        response: result.response,
+                        status: ExecutionStatus::Completed,
+                    });
+                }
+                NextAction::GoTo(target_id) => {
+                    if !self.tasks.contains_key(target_id) {
+                        return Err(GraphError::TaskNotFound(target_id.clone()));
+                    }
                     session.current_task_id = target_id.clone();
-                    Ok(ExecutionResult {
+                    return Ok(ExecutionResult {
                         response: result.response,
-                        status: ExecutionStatus::Paused { 
+                        status: ExecutionStatus::Paused {
                             next_task_id: target_id.clone(),
                             reason: "Task requested jump to specific task".to_string(),
                         },
-                    })
-                } else {
-                    Err(GraphError::TaskNotFound(target_id.clone()))
+                    });
                 }
-            }
-            NextAction::GoBack => {
-                // Update session status message if provided
-                session.status_message = result.status_message.clone();
-                // For now, stay at current task - could implement back navigation logic later
-                session.current_task_id = result.task_id.clone();
-                Ok(ExecutionResult {
-                    response: result.response,
-                    status: ExecutionStatus::WaitingForInput,
-                })
+                NextAction::GoBack => {
+                    // Not implemented: stay at current task and wait for input
+                    session.current_task_id = result.task_id.clone();
+                    return Ok(ExecutionResult {
+                        response: result.response,
+                        status: ExecutionStatus::WaitingForInput,
+                    });
+                }
             }
         }
     }
@@ -237,22 +253,28 @@ impl Graph {
             task_id = %task_id,
             "Executing single task"
         );
-        
+
         let task = self
             .tasks
             .get(task_id)
-            .ok_or_else(|| GraphError::TaskNotFound(task_id.to_string()))?;
+            .ok_or_else(|| GraphError::TaskNotFound(task_id.to_string()))?
+            .clone();
 
         // Execute task with timeout
-        let task_future = task.run(context);
-        let mut result = match timeout(self.task_timeout, task_future).await {
+        let mut result = match timeout(self.task_timeout, task.run(context)).await {
             Ok(Ok(result)) => result,
-            Ok(Err(e)) => return Err(GraphError::TaskExecutionFailed(
-                format!("Task '{}' failed: {}", task_id, e)
-            )),
-            Err(_) => return Err(GraphError::TaskExecutionFailed(
-                format!("Task '{}' timed out after {:?}", task_id, self.task_timeout)
-            )),
+            Ok(Err(e)) => {
+                return Err(GraphError::TaskExecutionFailed(format!(
+                    "Task '{}' failed: {}",
+                    task_id, e
+                )));
+            }
+            Err(_) => {
+                return Err(GraphError::TaskExecutionFailed(format!(
+                    "Task '{}' timed out after {:?}",
+                    task_id, self.task_timeout
+                )));
+            }
         };
 
         // Set the task_id in the result to track which task generated it
@@ -261,17 +283,19 @@ impl Graph {
         Ok(result)
     }
 
-    /// Execute the graph starting from a specific task
+    /// Execute the graph starting from a specific task.
+    ///
+    /// Note that this method's `NextAction` semantics differ from
+    /// [`Graph::execute_session`]: `Continue` recurses into the next task when
+    /// the current task produced no response, and `ContinueAndExecute` stops.
+    #[deprecated(
+        since = "0.5.2",
+        note = "use execute_session (or FlowRunner::run) instead; this method's NextAction \
+                semantics are inconsistent with the documented behavior and it will be removed \
+                in a future release"
+    )]
     pub async fn execute(&self, task_id: &str, context: Context) -> Result<TaskResult> {
-        let task = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| GraphError::TaskNotFound(task_id.to_string()))?;
-
-        let mut result = task.run(context.clone()).await?;
-
-        // Set the task_id in the result to track which task generated it
-        result.task_id = task_id.to_string();
+        let result = self.execute_single_task(task_id, context.clone()).await?;
 
         // Handle next action
         match &result.next_action {
@@ -302,17 +326,17 @@ impl Graph {
 
     /// Find the next task based on edges and conditions
     pub fn find_next_task(&self, current_task_id: &str, context: &Context) -> Option<String> {
-        let edges = self.edges.lock().unwrap();
+        let edges = self.edges.get(current_task_id)?;
 
-        let mut fallback: Option<String> = None;
-        for edge in edges.iter().filter(|e| e.from == current_task_id) {
+        let mut fallback: Option<&Edge> = None;
+        for edge in edges.iter() {
             match &edge.condition {
                 Some(pred) if pred(context) => return Some(edge.to.clone()),
-                None if fallback.is_none() => fallback = Some(edge.to.clone()),
+                None if fallback.is_none() => fallback = Some(edge),
                 _ => {}
             }
         }
-        fallback
+        fallback.map(|edge| edge.to.clone())
     }
 
     /// Get the start task ID
@@ -367,41 +391,56 @@ impl GraphBuilder {
         self
     }
 
+    /// Set the timeout applied to each task execution (default: 5 minutes).
+    pub fn with_task_timeout(mut self, timeout: Duration) -> Self {
+        self.graph.set_task_timeout(timeout);
+        self
+    }
+
+    /// Limit the number of chained `ContinueAndExecute` steps within a single
+    /// `execute_session` call, guarding against infinite loops in cyclic
+    /// graphs (default: unlimited).
+    pub fn with_max_execution_steps(mut self, max: usize) -> Self {
+        self.graph.set_max_execution_steps(Some(max));
+        self
+    }
+
     pub fn build(self) -> Graph {
         // Validate the graph before returning
         if self.graph.tasks.is_empty() {
             tracing::warn!("Building graph with no tasks");
         }
-        
-        // Check for orphaned tasks (tasks with no incoming or outgoing edges)
-        let task_count = self.graph.tasks.len();
-        if task_count > 1 {
-            // Collect task IDs first
-            let all_task_ids: Vec<String> = self.graph.tasks.iter()
-                .map(|t| t.key().clone())
-                .collect();
-            
-            // Then check edges
-            let edges = self.graph.edges.lock().unwrap();
-            let mut connected_tasks = std::collections::HashSet::new();
-            
-            for edge in edges.iter() {
+
+        let mut connected_tasks = std::collections::HashSet::new();
+        for bucket in self.graph.edges.iter() {
+            for edge in bucket.value() {
                 connected_tasks.insert(edge.from.clone());
                 connected_tasks.insert(edge.to.clone());
+
+                // Warn about edges pointing at tasks that were never added
+                for endpoint in [&edge.from, &edge.to] {
+                    if !self.graph.tasks.contains_key(endpoint) {
+                        tracing::warn!(
+                            task_id = %endpoint,
+                            "Edge references a task that has not been added to the graph"
+                        );
+                    }
+                }
             }
-            drop(edges); // Explicitly drop the lock
-            
-            // Now check for orphaned tasks
-            for task_id in all_task_ids {
-                if !connected_tasks.contains(&task_id) {
+        }
+
+        // Check for orphaned tasks (tasks with no incoming or outgoing edges)
+        if self.graph.tasks.len() > 1 {
+            for task in self.graph.tasks.iter() {
+                if !connected_tasks.contains(task.key()) {
                     tracing::warn!(
-                        task_id = %task_id,
+                        task_id = %task.key(),
                         "Task has no edges - it may be unreachable"
                     );
                 }
             }
         }
-        
+
         self.graph
     }
 }
@@ -416,7 +455,7 @@ pub struct ExecutionResult {
 #[derive(Debug, Clone)]
 pub enum ExecutionStatus {
     /// Paused, will continue automatically to the specified next task
-    Paused { 
+    Paused {
         next_task_id: String,
         reason: String,
     },
@@ -425,5 +464,9 @@ pub enum ExecutionStatus {
     /// Workflow completed successfully
     Completed,
     /// Error occurred during execution
+    ///
+    /// Note: the engine currently reports failures via `Err(GraphError)`
+    /// rather than this variant; it is kept for API compatibility and may be
+    /// removed in a future major release.
     Error(String),
 }

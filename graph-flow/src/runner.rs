@@ -282,6 +282,14 @@ impl FlowRunner {
     /// - Task execution fails
     /// - Storage operations fail
     ///
+    /// # Concurrency
+    ///
+    /// This is a load → execute → save cycle with no locking: two concurrent
+    /// `run` calls for the *same* session id race, and the later save wins
+    /// (lost update). Serialize requests per session (e.g. per-session mutex,
+    /// sticky routing, or a queue) if your service can receive concurrent
+    /// requests for one session.
+    ///
     /// # Examples
     ///
     /// ## Basic Execution

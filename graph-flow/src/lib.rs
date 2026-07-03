@@ -215,6 +215,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // exercises the deprecated Graph::execute until it is removed
     async fn test_simple_graph_execution() {
         let task = Arc::new(TestTask {
             id: "test_task".to_string(),

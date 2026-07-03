@@ -283,8 +283,13 @@ pub enum NextAction {
 
     /// Go back to the previous task.
     ///
-    /// Note: This currently stays at the current task. Full back navigation
-    /// logic may be implemented in future versions.
+    /// Note: This was never implemented - it behaves like `WaitForInput`
+    /// (stays at the current task). It will be removed in a future release.
+    #[deprecated(
+        since = "0.5.2",
+        note = "GoBack is not implemented (it behaves like WaitForInput) and will be removed; \
+                use NextAction::GoTo(task_id) for explicit navigation"
+    )]
     GoBack,
 
     /// End the graph execution.

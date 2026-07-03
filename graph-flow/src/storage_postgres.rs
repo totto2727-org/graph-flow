@@ -1,15 +1,25 @@
 use async_trait::async_trait;
 use serde_json;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
-use std::sync::Arc;
 
 use crate::{Session, error::{Result, GraphError}, storage::SessionStorage};
 
+/// PostgreSQL-backed [`SessionStorage`] implementation.
+///
+/// Note: the `sessions` table stores ids as `UUID`, so [`Session::id`] must be
+/// a valid UUID string - other values fail at runtime with a cast error.
+///
+/// Sessions are saved with last-write-wins semantics: there is no optimistic
+/// locking, so avoid running the same session concurrently from multiple
+/// workers (the later save silently overwrites the earlier one).
 pub struct PostgresSessionStorage {
-    pool: Arc<Pool<Postgres>>,
+    pool: Pool<Postgres>,
 }
 
 impl PostgresSessionStorage {
+    /// Connect with default pool settings (5 max connections) and run the
+    /// schema migration. Use [`PostgresSessionStorage::with_pool`] for custom
+    /// pool configuration.
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -17,8 +27,14 @@ impl PostgresSessionStorage {
             .await
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to Postgres: {e}")))?;
 
+        Self::with_pool(pool).await
+    }
+
+    /// Build the storage from a pre-configured pool (custom connection limits,
+    /// timeouts, etc.) and run the schema migration.
+    pub async fn with_pool(pool: Pool<Postgres>) -> Result<Self> {
         Self::migrate(&pool).await?;
-        Ok(Self { pool: Arc::new(pool) })
+        Ok(Self { pool })
     }
 
     async fn migrate(pool: &Pool<Postgres>) -> Result<()> {
@@ -48,10 +64,7 @@ impl SessionStorage for PostgresSessionStorage {
         let context_json = serde_json::to_value(&session.context)
             .map_err(|e| GraphError::StorageError(format!("Context serialization failed: {e}")))?;
 
-        // Use a transaction to ensure atomicity
-        let mut tx = self.pool.begin().await
-            .map_err(|e| GraphError::StorageError(format!("Failed to start transaction: {e}")))?;
-
+        // Single upsert - already atomic, no explicit transaction needed.
         sqlx::query(
             r#"
             INSERT INTO sessions (id, graph_id, current_task_id, status_message, context, updated_at)
@@ -62,7 +75,6 @@ impl SessionStorage for PostgresSessionStorage {
                 status_message = EXCLUDED.status_message,
                 context = EXCLUDED.context,
                 updated_at = NOW()
-            WHERE sessions.updated_at <= EXCLUDED.updated_at  -- Prevent overwriting newer data
             "#,
         )
         .bind(&session.id)
@@ -70,13 +82,10 @@ impl SessionStorage for PostgresSessionStorage {
         .bind(&session.current_task_id)
         .bind(&session.status_message)
         .bind(&context_json)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await
         .map_err(|e| GraphError::StorageError(format!("Failed to save session: {e}")))?;
-        
-        tx.commit().await
-            .map_err(|e| GraphError::StorageError(format!("Failed to commit transaction: {e}")))?;
-        
+
         Ok(())
     }
 
@@ -89,7 +98,7 @@ impl SessionStorage for PostgresSessionStorage {
             "#,
         )
         .bind(id)
-        .fetch_optional(&*self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| GraphError::StorageError(format!("Failed to fetch session: {e}")))?;
 
@@ -115,7 +124,7 @@ impl SessionStorage for PostgresSessionStorage {
             "#,
         )
         .bind(id)
-        .execute(&*self.pool)
+        .execute(&self.pool)
         .await
         .map_err(|e| GraphError::StorageError(format!("Failed to delete session: {e}")))?;
         Ok(())

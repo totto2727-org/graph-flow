@@ -17,6 +17,10 @@ pub struct Session {
 }
 
 impl Session {
+    /// Create a new session positioned at the given task.
+    ///
+    /// Note: `graph_id` is set to `"default"`; assign it explicitly if you
+    /// store multiple graphs.
     pub fn new_from_task(sid: String, task_name: &str) -> Self {
         Self {
             id: sid,
@@ -46,7 +50,7 @@ pub trait SessionStorage: Send + Sync {
 
 /// In-memory implementation of GraphStorage
 pub struct InMemoryGraphStorage {
-    graphs: Arc<DashMap<String, Arc<Graph>>>,
+    graphs: DashMap<String, Arc<Graph>>,
 }
 
 impl Default for InMemoryGraphStorage {
@@ -58,7 +62,7 @@ impl Default for InMemoryGraphStorage {
 impl InMemoryGraphStorage {
     pub fn new() -> Self {
         Self {
-            graphs: Arc::new(DashMap::new()),
+            graphs: DashMap::new(),
         }
     }
 }
@@ -82,7 +86,7 @@ impl GraphStorage for InMemoryGraphStorage {
 
 /// In-memory implementation of SessionStorage
 pub struct InMemorySessionStorage {
-    sessions: Arc<DashMap<String, Session>>,
+    sessions: DashMap<String, Session>,
 }
 
 impl Default for InMemorySessionStorage {
@@ -94,7 +98,7 @@ impl Default for InMemorySessionStorage {
 impl InMemorySessionStorage {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(DashMap::new()),
+            sessions: DashMap::new(),
         }
     }
 }

@@ -17,7 +17,10 @@
 //! - By default, all children share the same `Context` (concurrent writes must be
 //!   coordinated by the user). To avoid key collisions, you can set a prefix so that
 //!   each child’s output is stored under `"<prefix>.<child_id>.*"`.
-//! - Error policy is conservative: if any child fails, `FanOutTask` fails.
+//! - Error policy is conservative: if any child fails, `FanOutTask` fails with
+//!   the *first* error observed. Note that other children still run to
+//!   completion, so the context may contain partial results from successful
+//!   children even when the fan-out as a whole returns an error.
 //!
 //! Example:
 //! ```rust
@@ -126,33 +129,48 @@ impl Task for FanOutTask {
             });
         }
 
-        let mut had_error = None;
+        // Keep the *first* failure so the reported error is deterministic;
+        // remaining children still run to completion and their outputs are
+        // aggregated into the context even when an error is returned.
+        let mut first_error = None;
         let mut completed = 0usize;
 
         while let Some(joined) = set.join_next().await {
             match joined {
                 Err(join_err) => {
-                    had_error = Some(GraphError::TaskExecutionFailed(format!(
-                        "FanOut child join error: {}", join_err
-                    )));
+                    first_error.get_or_insert_with(|| {
+                        GraphError::TaskExecutionFailed(format!(
+                            "FanOut child join error: {}",
+                            join_err
+                        ))
+                    });
                 }
                 Ok((child_id, outcome)) => match outcome {
                     Err(e) => {
-                        had_error = Some(GraphError::TaskExecutionFailed(format!(
-                            "FanOut child '{}' failed: {}", child_id, e
-                        )));
+                        first_error.get_or_insert_with(|| {
+                            GraphError::TaskExecutionFailed(format!(
+                                "FanOut child '{}' failed: {}",
+                                child_id, e
+                            ))
+                        });
                     }
                     Ok(tr) => {
                         // Store child outputs under prefixed keys
-                        if let Some(resp) = tr.response.clone() {
+                        let TaskResult {
+                            response,
+                            status_message,
+                            next_action,
+                            ..
+                        } = tr;
+                        if let Some(resp) = response {
                             context.set(self.key(&child_id, "response"), resp).await;
                         }
-                        if let Some(status) = tr.status_message.clone() {
+                        if let Some(status) = status_message {
                             context.set(self.key(&child_id, "status"), status).await;
                         }
                         // Always store the reported next_action for diagnostics
                         context
-                            .set(self.key(&child_id, "next_action"), format!("{:?}", tr.next_action))
+                            .set(self.key(&child_id, "next_action"), format!("{:?}", next_action))
                             .await;
                         completed += 1;
                     }
@@ -160,7 +178,7 @@ impl Task for FanOutTask {
             }
         }
 
-        if let Some(err) = had_error {
+        if let Some(err) = first_error {
             return Err(err);
         }
 

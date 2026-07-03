@@ -102,7 +102,9 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use crate::error::GraphError;
 
 #[cfg(feature = "rig")]
 use rig::completion::Message;
@@ -278,10 +280,10 @@ impl ChatHistory {
     fn add_message(&mut self, message: SerializableMessage) {
         self.messages.push(message);
 
-        if let Some(max) = self.max_messages {
-            if self.messages.len() > max {
-                self.messages.drain(0..(self.messages.len() - max));
-            }
+        if let Some(max) = self.max_messages
+            && self.messages.len() > max
+        {
+            self.messages.drain(0..(self.messages.len() - max));
         }
     }
 
@@ -430,6 +432,25 @@ impl Context {
         }
     }
 
+    /// Acquire the chat history read lock, recovering from poisoning.
+    ///
+    /// A poisoned lock means a task panicked while holding it; the history
+    /// itself is still valid (messages are appended atomically), so we recover
+    /// the guard rather than silently returning empty data.
+    fn history_read(&self) -> RwLockReadGuard<'_, ChatHistory> {
+        self.chat_history
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Acquire the chat history write lock, recovering from poisoning (see
+    /// [`Context::history_read`]).
+    fn history_write(&self) -> RwLockWriteGuard<'_, ChatHistory> {
+        self.chat_history
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // Regular context methods (unchanged API)
 
     /// Set a value in the context.
@@ -462,9 +483,39 @@ impl Context {
     /// context.set("user", user).await;
     /// # }
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value cannot be serialized to JSON (e.g. a map with
+    /// non-string keys). Use [`Context::try_set`] to handle this as an error.
     pub async fn set(&self, key: impl Into<String>, value: impl serde::Serialize) {
-        let value = serde_json::to_value(value).expect("Failed to serialize value");
-        self.data.insert(key.into(), value);
+        self.set_sync(key, value);
+    }
+
+    /// Fallible version of [`Context::set`].
+    ///
+    /// Returns `Err(GraphError::ContextError)` instead of panicking when the
+    /// value cannot be serialized to JSON.
+    pub async fn try_set(
+        &self,
+        key: impl Into<String>,
+        value: impl serde::Serialize,
+    ) -> crate::error::Result<()> {
+        self.try_set_sync(key, value)
+    }
+
+    /// Synchronous, fallible version of [`Context::set`] (see [`Context::try_set`]).
+    pub fn try_set_sync(
+        &self,
+        key: impl Into<String>,
+        value: impl serde::Serialize,
+    ) -> crate::error::Result<()> {
+        let key = key.into();
+        let value = serde_json::to_value(value).map_err(|e| {
+            GraphError::ContextError(format!("Failed to serialize value for key '{key}': {e}"))
+        })?;
+        self.data.insert(key, value);
+        Ok(())
     }
 
     /// Get a value from the context.
@@ -489,9 +540,7 @@ impl Context {
     /// # }
     /// ```
     pub async fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        self.data
-            .get(key)
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        self.get_sync(key)
     }
 
     /// Remove a value from the context.
@@ -573,9 +622,20 @@ impl Context {
     /// # }
     /// ```
     pub fn get_sync<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        self.data
-            .get(key)
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        let entry = self.data.get(key)?;
+        // Deserialize straight from a reference to avoid cloning the stored
+        // Value (which can be large, e.g. documents or chat transcripts).
+        match T::deserialize(entry.value()) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::warn!(
+                    key = %key,
+                    error = %e,
+                    "Context value exists but failed to deserialize to the requested type"
+                );
+                None
+            }
+        }
     }
 
     /// Synchronous version of set for use when async is not available.
@@ -591,6 +651,11 @@ impl Context {
     /// let value: Option<String> = context.get_sync("key");
     /// assert_eq!(value, Some("value".to_string()));
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value cannot be serialized to JSON. Use
+    /// [`Context::try_set_sync`] to handle this as an error.
     pub fn set_sync(&self, key: impl Into<String>, value: impl serde::Serialize) {
         let value = serde_json::to_value(value).expect("Failed to serialize value");
         self.data.insert(key.into(), value);
@@ -612,9 +677,7 @@ impl Context {
     /// # }
     /// ```
     pub async fn add_user_message(&self, content: String) {
-        if let Ok(mut history) = self.chat_history.write() {
-            history.add_user_message(content);
-        }
+        self.history_write().add_user_message(content);
     }
 
     /// Add an assistant message to the chat history.
@@ -631,9 +694,7 @@ impl Context {
     /// # }
     /// ```
     pub async fn add_assistant_message(&self, content: String) {
-        if let Ok(mut history) = self.chat_history.write() {
-            history.add_assistant_message(content);
-        }
+        self.history_write().add_assistant_message(content);
     }
 
     /// Add a system message to the chat history.
@@ -650,9 +711,7 @@ impl Context {
     /// # }
     /// ```
     pub async fn add_system_message(&self, content: String) {
-        if let Ok(mut history) = self.chat_history.write() {
-            history.add_system_message(content);
-        }
+        self.history_write().add_system_message(content);
     }
 
     /// Get a clone of the current chat history.
@@ -672,11 +731,7 @@ impl Context {
     /// # }
     /// ```
     pub async fn get_chat_history(&self) -> ChatHistory {
-        if let Ok(history) = self.chat_history.read() {
-            history.clone()
-        } else {
-            ChatHistory::new()
-        }
+        self.history_read().clone()
     }
 
     /// Clear the chat history.
@@ -697,27 +752,17 @@ impl Context {
     /// # }
     /// ```
     pub async fn clear_chat_history(&self) {
-        if let Ok(mut history) = self.chat_history.write() {
-            history.clear();
-        }
+        self.history_write().clear();
     }
 
     /// Get the number of messages in the chat history.
     pub async fn chat_history_len(&self) -> usize {
-        if let Ok(history) = self.chat_history.read() {
-            history.len()
-        } else {
-            0
-        }
+        self.history_read().len()
     }
 
     /// Check if the chat history is empty.
     pub async fn is_chat_history_empty(&self) -> bool {
-        if let Ok(history) = self.chat_history.read() {
-            history.is_empty()
-        } else {
-            true
-        }
+        self.history_read().is_empty()
     }
 
     /// Get the last N messages from chat history.
@@ -741,11 +786,7 @@ impl Context {
     /// # }
     /// ```
     pub async fn get_last_messages(&self, n: usize) -> Vec<SerializableMessage> {
-        if let Ok(history) = self.chat_history.read() {
-            history.last_messages(n).to_vec()
-        } else {
-            Vec::new()
-        }
+        self.history_read().last_messages(n).to_vec()
     }
 
     /// Get all messages from chat history as SerializableMessage.
@@ -766,11 +807,7 @@ impl Context {
     /// # }
     /// ```
     pub async fn get_all_messages(&self) -> Vec<SerializableMessage> {
-        if let Ok(history) = self.chat_history.read() {
-            history.messages().to_vec()
-        } else {
-            Vec::new()
-        }
+        self.history_read().messages().to_vec()
     }
 
     // Rig integration methods (only available when rig feature is enabled)
@@ -799,10 +836,10 @@ impl Context {
     /// # }
     /// ```
     pub async fn get_rig_messages(&self) -> Vec<Message> {
-        let messages = self.get_all_messages().await;
-        messages
-            .iter()
-            .map(|msg| self.to_rig_message(msg))
+        self.get_all_messages()
+            .await
+            .into_iter()
+            .map(Message::from)
             .collect()
     }
 
@@ -831,22 +868,25 @@ impl Context {
     /// # }
     /// ```
     pub async fn get_last_rig_messages(&self, n: usize) -> Vec<Message> {
-        let messages = self.get_last_messages(n).await;
-        messages
-            .iter()
-            .map(|msg| self.to_rig_message(msg))
+        self.get_last_messages(n)
+            .await
+            .into_iter()
+            .map(Message::from)
             .collect()
     }
+}
 
-    #[cfg(feature = "rig")]
-    /// Convert a SerializableMessage to a rig::completion::Message.
+#[cfg(feature = "rig")]
+impl From<SerializableMessage> for Message {
+    /// Convert a [`SerializableMessage`] into a `rig::completion::Message`,
+    /// moving the content instead of cloning it.
     ///
-    /// This method is only available when the "rig" feature is enabled.
-    fn to_rig_message(&self, msg: &SerializableMessage) -> Message {
+    /// Only available when the "rig" feature is enabled.
+    fn from(msg: SerializableMessage) -> Self {
         match msg.role {
-            MessageRole::User => Message::user(msg.content.clone()),
-            MessageRole::Assistant => Message::assistant(msg.content.clone()),
-            MessageRole::System => Message::system(msg.content.clone()),
+            MessageRole::User => Message::user(msg.content),
+            MessageRole::Assistant => Message::assistant(msg.content),
+            MessageRole::System => Message::system(msg.content),
         }
     }
 }
@@ -870,11 +910,7 @@ impl Serialize for Context {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
-        let chat_history = if let Ok(history) = self.chat_history.read() {
-            history.clone()
-        } else {
-            ChatHistory::new()
-        };
+        let chat_history = self.history_read().clone();
 
         let context_data = ContextData { data, chat_history };
         context_data.serialize(serializer)
