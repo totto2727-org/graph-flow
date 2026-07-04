@@ -19,7 +19,6 @@ impl Task for PdfExtractTask {
 
         let document: MedicalDocument = context
             .get("document")
-            .await
             .ok_or_else(|| GraphError::ContextError("Document not found in context".to_string()))?;
 
         let pdf_path = &document.pdf_path;
@@ -52,7 +51,7 @@ impl Task for PdfExtractTask {
         updated_document.extracted_text = Some(extracted_text);
         updated_document.initial_summary = Some(initial_summary);
 
-        context.set("document", updated_document).await;
+        context.set("document", updated_document)?;
 
         info!("PDF LLM OCR and summary completed successfully");
         Ok(TaskResult::new_with_status(

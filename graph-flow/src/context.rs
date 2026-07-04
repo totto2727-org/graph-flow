@@ -3,6 +3,11 @@
 //! This module provides thread-safe state management across workflow tasks,
 //! including regular data storage and specialized chat history management.
 //!
+//! All `Context` methods are synchronous: the underlying storage is an
+//! in-memory map guarded by short critical sections, so there is nothing to
+//! await. Methods can be called freely from both async tasks and sync code
+//! (e.g. edge-condition closures).
+//!
 //! # Examples
 //!
 //! ## Basic Context Usage
@@ -10,22 +15,19 @@
 //! ```rust
 //! use graph_flow::Context;
 //!
-//! # #[tokio::main]
-//! # async fn main() {
+//! # fn main() -> graph_flow::Result<()> {
 //! let context = Context::new();
 //!
 //! // Store different types of data
-//! context.set("user_id", 12345).await;
-//! context.set("name", "Alice".to_string()).await;
-//! context.set("active", true).await;
+//! context.set("user_id", 12345)?;
+//! context.set("name", "Alice".to_string())?;
+//! context.set("active", true)?;
 //!
 //! // Retrieve data with type safety
-//! let user_id: Option<i32> = context.get("user_id").await;
-//! let name: Option<String> = context.get("name").await;
-//! let active: Option<bool> = context.get("active").await;
-//!
-//! // Synchronous access (useful in edge conditions)
-//! let name_sync: Option<String> = context.get_sync("name");
+//! let user_id: Option<i32> = context.get("user_id");
+//! let name: Option<String> = context.get("name");
+//! let active: Option<bool> = context.get("active");
+//! # Ok(())
 //! # }
 //! ```
 //!
@@ -34,24 +36,21 @@
 //! ```rust
 //! use graph_flow::Context;
 //!
-//! # #[tokio::main]
-//! # async fn main() {
 //! let context = Context::new();
 //!
 //! // Add messages to chat history
-//! context.add_user_message("Hello, assistant!".to_string()).await;
-//! context.add_assistant_message("Hello! How can I help you?".to_string()).await;
-//! context.add_system_message("User session started".to_string()).await;
+//! context.add_user_message("Hello, assistant!".to_string());
+//! context.add_assistant_message("Hello! How can I help you?".to_string());
+//! context.add_system_message("User session started".to_string());
 //!
 //! // Get chat history
-//! let history = context.get_chat_history().await;
-//! let all_messages = context.get_all_messages().await;
-//! let last_5 = context.get_last_messages(5).await;
+//! let history = context.get_chat_history();
+//! let all_messages = context.get_all_messages();
+//! let last_5 = context.get_last_messages(5);
 //!
 //! // Check history status
-//! let count = context.chat_history_len().await;
-//! let is_empty = context.is_chat_history_empty().await;
-//! # }
+//! let count = context.chat_history_len();
+//! let is_empty = context.is_chat_history_empty();
 //! ```
 //!
 //! ## Context with Message Limits
@@ -59,19 +58,16 @@
 //! ```rust
 //! use graph_flow::Context;
 //!
-//! # #[tokio::main]
-//! # async fn main() {
 //! // Create context with maximum 100 messages
 //! let context = Context::with_max_chat_messages(100);
 //!
 //! // Messages will be automatically pruned when limit is exceeded
 //! for i in 0..150 {
-//!     context.add_user_message(format!("Message {}", i)).await;
+//!     context.add_user_message(format!("Message {}", i));
 //! }
 //!
 //! // Only the last 100 messages are kept
-//! assert_eq!(context.chat_history_len().await, 100);
-//! # }
+//! assert_eq!(context.chat_history_len(), 100);
 //! ```
 //!
 //! ## LLM Integration (with `rig` feature)
@@ -81,20 +77,17 @@
 //! # {
 //! use graph_flow::Context;
 //!
-//! # #[tokio::main]
-//! # async fn main() {
 //! let context = Context::new();
 //!
-//! context.add_user_message("What is the capital of France?".to_string()).await;
-//! context.add_assistant_message("The capital of France is Paris.".to_string()).await;
+//! context.add_user_message("What is the capital of France?".to_string());
+//! context.add_assistant_message("The capital of France is Paris.".to_string());
 //!
 //! // Get messages in rig format for LLM calls
-//! let rig_messages = context.get_rig_messages().await;
-//! let recent_messages = context.get_last_rig_messages(10).await;
+//! let rig_messages = context.get_rig_messages();
+//! let recent_messages = context.get_last_rig_messages(10);
 //!
 //! // Use with rig's completion API
-//! // let response = agent.completion(&rig_messages).await?;
-//! # }
+//! // let response = agent.chat(&user_input, rig_messages).await?;
 //! # }
 //! ```
 
@@ -102,6 +95,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::error::GraphError;
@@ -164,40 +158,16 @@ impl SerializableMessage {
     }
 
     /// Create a new user message.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::SerializableMessage;
-    ///
-    /// let msg = SerializableMessage::user("Hello, world!".to_string());
-    /// ```
     pub fn user(content: String) -> Self {
         Self::new(MessageRole::User, content)
     }
 
     /// Create a new assistant message.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::SerializableMessage;
-    ///
-    /// let msg = SerializableMessage::assistant("Hello! How can I help?".to_string());
-    /// ```
     pub fn assistant(content: String) -> Self {
         Self::new(MessageRole::Assistant, content)
     }
 
     /// Create a new system message.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::SerializableMessage;
-    ///
-    /// let msg = SerializableMessage::system("User logged in".to_string());
-    /// ```
     pub fn system(content: String) -> Self {
         Self::new(MessageRole::System, content)
     }
@@ -205,8 +175,8 @@ impl SerializableMessage {
 
 /// Container for managing chat history with serialization support.
 ///
-/// Provides automatic message limit management and convenient methods
-/// for adding and retrieving messages.
+/// Messages are stored in a ring buffer: when the configured limit is
+/// exceeded, the oldest message is dropped in O(1).
 ///
 /// # Examples
 ///
@@ -219,10 +189,13 @@ impl SerializableMessage {
 ///
 /// assert_eq!(history.len(), 2);
 /// assert!(!history.is_empty());
+///
+/// let contents: Vec<&str> = history.messages().map(|m| m.content.as_str()).collect();
+/// assert_eq!(contents, ["Hello", "Hi there!"]);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatHistory {
-    messages: Vec<SerializableMessage>,
+    messages: VecDeque<SerializableMessage>,
     max_messages: Option<usize>,
 }
 
@@ -230,7 +203,7 @@ impl ChatHistory {
     /// Create a new empty chat history with a default limit of 1000 messages.
     pub fn new() -> Self {
         Self {
-            messages: Vec::new(),
+            messages: VecDeque::new(),
             max_messages: Some(1000), // Default limit to prevent unbounded growth
         }
     }
@@ -246,7 +219,6 @@ impl ChatHistory {
     ///
     /// let mut history = ChatHistory::with_max_messages(10);
     ///
-    /// // Add 15 messages
     /// for i in 0..15 {
     ///     history.add_user_message(format!("Message {}", i));
     /// }
@@ -256,7 +228,7 @@ impl ChatHistory {
     /// ```
     pub fn with_max_messages(max: usize) -> Self {
         Self {
-            messages: Vec::new(),
+            messages: VecDeque::new(),
             max_messages: Some(max),
         }
     }
@@ -278,12 +250,12 @@ impl ChatHistory {
 
     /// Add a message to the chat history, respecting max_messages limit.
     fn add_message(&mut self, message: SerializableMessage) {
-        self.messages.push(message);
+        self.messages.push_back(message);
 
-        if let Some(max) = self.max_messages
-            && self.messages.len() > max
-        {
-            self.messages.drain(0..(self.messages.len() - max));
+        if let Some(max) = self.max_messages {
+            while self.messages.len() > max {
+                self.messages.pop_front();
+            }
         }
     }
 
@@ -302,12 +274,12 @@ impl ChatHistory {
         self.messages.is_empty()
     }
 
-    /// Get a reference to all messages.
-    pub fn messages(&self) -> &[SerializableMessage] {
-        &self.messages
+    /// Iterate over all messages, oldest first.
+    pub fn messages(&self) -> impl Iterator<Item = &SerializableMessage> + '_ {
+        self.messages.iter()
     }
 
-    /// Get the last N messages.
+    /// Iterate over the last N messages, oldest first.
     ///
     /// If N is greater than the total number of messages, all messages are returned.
     ///
@@ -321,18 +293,13 @@ impl ChatHistory {
     /// history.add_user_message("Message 2".to_string());
     /// history.add_user_message("Message 3".to_string());
     ///
-    /// let last_two = history.last_messages(2);
-    /// assert_eq!(last_two.len(), 2);
-    /// assert_eq!(last_two[0].content, "Message 2");
-    /// assert_eq!(last_two[1].content, "Message 3");
+    /// let last_two: Vec<&str> = history.last_messages(2).map(|m| m.content.as_str()).collect();
+    /// assert_eq!(last_two, ["Message 2", "Message 3"]);
     /// ```
-    pub fn last_messages(&self, n: usize) -> &[SerializableMessage] {
-        let start = if self.messages.len() > n {
-            self.messages.len() - n
-        } else {
-            0
-        };
-        &self.messages[start..]
+    pub fn last_messages(&self, n: usize) -> impl Iterator<Item = &SerializableMessage> + '_ {
+        self.messages
+            .iter()
+            .skip(self.messages.len().saturating_sub(n))
     }
 }
 
@@ -346,47 +313,27 @@ struct ContextData {
 /// Context for sharing data between tasks in a graph execution.
 ///
 /// Provides thread-safe storage for workflow state and dedicated chat history
-/// management. The context is shared across all tasks in a workflow execution.
+/// management. The context is shared across all tasks in a workflow execution
+/// (cloning a `Context` is cheap and yields a handle to the same state).
+///
+/// All methods are synchronous - see the [module docs](self) for rationale.
 ///
 /// # Examples
 ///
-/// ## Basic Usage
-///
 /// ```rust
 /// use graph_flow::Context;
 ///
-/// # #[tokio::main]
-/// # async fn main() {
+/// # fn main() -> graph_flow::Result<()> {
 /// let context = Context::new();
 ///
-/// // Store different types of data
-/// context.set("user_id", 12345).await;
-/// context.set("name", "Alice".to_string()).await;
-/// context.set("settings", vec!["opt1", "opt2"]).await;
+/// // Typed key-value state
+/// context.set("user_id", 12345)?;
+/// let user_id: Option<i32> = context.get("user_id");
 ///
-/// // Retrieve data
-/// let user_id: Option<i32> = context.get("user_id").await;
-/// let name: Option<String> = context.get("name").await;
-/// let settings: Option<Vec<String>> = context.get("settings").await;
-/// # }
-/// ```
-///
-/// ## Chat History
-///
-/// ```rust
-/// use graph_flow::Context;
-///
-/// # #[tokio::main]
-/// # async fn main() {
-/// let context = Context::new();
-///
-/// // Add messages
-/// context.add_user_message("Hello".to_string()).await;
-/// context.add_assistant_message("Hi there!".to_string()).await;
-///
-/// // Get message history
-/// let history = context.get_chat_history().await;
-/// let last_5 = context.get_last_messages(5).await;
+/// // Chat history
+/// context.add_user_message("Hello".to_string());
+/// let history = context.get_chat_history();
+/// # Ok(())
 /// # }
 /// ```
 #[derive(Clone, Debug)]
@@ -407,24 +354,6 @@ impl Context {
     /// Create a new context with a maximum chat history size.
     ///
     /// When the chat history exceeds this size, older messages are automatically removed.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::with_max_chat_messages(50);
-    ///
-    /// // Chat history will be limited to 50 messages
-    /// for i in 0..100 {
-    ///     context.add_user_message(format!("Message {}", i)).await;
-    /// }
-    ///
-    /// assert_eq!(context.chat_history_len().await, 50);
-    /// # }
-    /// ```
     pub fn with_max_chat_messages(max: usize) -> Self {
         Self {
             data: Arc::new(DashMap::new()),
@@ -451,11 +380,12 @@ impl Context {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    // Regular context methods (unchanged API)
+    // Regular context methods
 
     /// Set a value in the context.
     ///
-    /// The value must be serializable. Most common Rust types are supported.
+    /// Returns `Err(GraphError::ContextError)` if the value cannot be
+    /// serialized to JSON (e.g. a map with non-string keys).
     ///
     /// # Examples
     ///
@@ -469,47 +399,20 @@ impl Context {
     ///     name: String,
     /// }
     ///
-    /// # #[tokio::main]
-    /// # async fn main() {
+    /// # fn main() -> graph_flow::Result<()> {
     /// let context = Context::new();
     ///
     /// // Store primitive types
-    /// context.set("count", 42).await;
-    /// context.set("name", "Alice".to_string()).await;
-    /// context.set("active", true).await;
+    /// context.set("count", 42)?;
+    /// context.set("name", "Alice".to_string())?;
     ///
     /// // Store complex types
     /// let user = UserData { id: 1, name: "Bob".to_string() };
-    /// context.set("user", user).await;
+    /// context.set("user", user)?;
+    /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if the value cannot be serialized to JSON (e.g. a map with
-    /// non-string keys). Use [`Context::try_set`] to handle this as an error.
-    pub async fn set(&self, key: impl Into<String>, value: impl serde::Serialize) {
-        self.set_sync(key, value);
-    }
-
-    /// Fallible version of [`Context::set`].
-    ///
-    /// Returns `Err(GraphError::ContextError)` instead of panicking when the
-    /// value cannot be serialized to JSON.
-    pub async fn try_set(
-        &self,
-        key: impl Into<String>,
-        value: impl serde::Serialize,
-    ) -> crate::error::Result<()> {
-        self.try_set_sync(key, value)
-    }
-
-    /// Synchronous, fallible version of [`Context::set`] (see [`Context::try_set`]).
-    pub fn try_set_sync(
-        &self,
-        key: impl Into<String>,
-        value: impl serde::Serialize,
-    ) -> crate::error::Result<()> {
+    pub fn set(&self, key: impl Into<String>, value: impl serde::Serialize) -> crate::error::Result<()> {
         let key = key.into();
         let value = serde_json::to_value(value).map_err(|e| {
             GraphError::ContextError(format!("Failed to serialize value for key '{key}': {e}"))
@@ -520,108 +423,28 @@ impl Context {
 
     /// Get a value from the context.
     ///
-    /// Returns `None` if the key doesn't exist or if deserialization fails.
+    /// Returns `None` if the key doesn't exist or if the stored value cannot
+    /// be deserialized to the requested type (a warning is logged for the
+    /// latter, since it usually indicates a type mismatch bug).
     ///
     /// # Examples
     ///
     /// ```rust
     /// use graph_flow::Context;
     ///
-    /// # #[tokio::main]
-    /// # async fn main() {
+    /// # fn main() -> graph_flow::Result<()> {
     /// let context = Context::new();
-    /// context.set("count", 42).await;
+    /// context.set("count", 42)?;
     ///
-    /// let count: Option<i32> = context.get("count").await;
+    /// let count: Option<i32> = context.get("count");
     /// assert_eq!(count, Some(42));
     ///
-    /// let missing: Option<String> = context.get("missing").await;
+    /// let missing: Option<String> = context.get("missing");
     /// assert_eq!(missing, None);
+    /// # Ok(())
     /// # }
     /// ```
-    pub async fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        self.get_sync(key)
-    }
-
-    /// Remove a value from the context.
-    ///
-    /// Returns the removed value if it existed.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.set("temp", "value".to_string()).await;
-    ///
-    /// let removed = context.remove("temp").await;
-    /// assert!(removed.is_some());
-    ///
-    /// let value: Option<String> = context.get("temp").await;
-    /// assert_eq!(value, None);
-    /// # }
-    /// ```
-    pub async fn remove(&self, key: &str) -> Option<Value> {
-        self.data.remove(key).map(|(_, v)| v)
-    }
-
-    /// Clear all regular context data (does not affect chat history).
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.set("key1", "value1".to_string()).await;
-    /// context.set("key2", "value2".to_string()).await;
-    /// context.add_user_message("Hello".to_string()).await;
-    ///
-    /// context.clear().await;
-    ///
-    /// // Regular data is cleared
-    /// let value: Option<String> = context.get("key1").await;
-    /// assert_eq!(value, None);
-    ///
-    /// // Chat history is preserved
-    /// assert_eq!(context.chat_history_len().await, 1);
-    /// # }
-    /// ```
-    pub async fn clear(&self) {
-        self.data.clear();
-    }
-
-    /// Synchronous version of get for use in edge conditions.
-    ///
-    /// This method should only be used when you're certain the data exists
-    /// and when async is not available (e.g., in edge condition closures).
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::{Context, GraphBuilder};
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.set("condition", true).await;
-    ///
-    /// // Used in edge conditions
-    /// let graph = GraphBuilder::new("test")
-    ///     .add_conditional_edge(
-    ///         "task1",
-    ///         |ctx| ctx.get_sync::<bool>("condition").unwrap_or(false),
-    ///         "task2",
-    ///         "task3"
-    ///     );
-    /// # }
-    /// ```
-    pub fn get_sync<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+    pub fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         let entry = self.data.get(key)?;
         // Deserialize straight from a reference to avoid cloning the stored
         // Value (which can be large, e.g. documents or chat transcripts).
@@ -638,176 +461,63 @@ impl Context {
         }
     }
 
-    /// Synchronous version of set for use when async is not available.
+    /// Remove a value from the context.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// let context = Context::new();
-    /// context.set_sync("key", "value".to_string());
-    ///
-    /// let value: Option<String> = context.get_sync("key");
-    /// assert_eq!(value, Some("value".to_string()));
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if the value cannot be serialized to JSON. Use
-    /// [`Context::try_set_sync`] to handle this as an error.
-    pub fn set_sync(&self, key: impl Into<String>, value: impl serde::Serialize) {
-        let value = serde_json::to_value(value).expect("Failed to serialize value");
-        self.data.insert(key.into(), value);
+    /// Returns the removed value if it existed.
+    pub fn remove(&self, key: &str) -> Option<Value> {
+        self.data.remove(key).map(|(_, v)| v)
+    }
+
+    /// Clear all regular context data (does not affect chat history).
+    pub fn clear(&self) {
+        self.data.clear();
     }
 
     // Chat history methods
 
     /// Add a user message to the chat history.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_user_message("Hello, assistant!".to_string()).await;
-    /// # }
-    /// ```
-    pub async fn add_user_message(&self, content: String) {
+    pub fn add_user_message(&self, content: String) {
         self.history_write().add_user_message(content);
     }
 
     /// Add an assistant message to the chat history.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_assistant_message("Hello! How can I help you?".to_string()).await;
-    /// # }
-    /// ```
-    pub async fn add_assistant_message(&self, content: String) {
+    pub fn add_assistant_message(&self, content: String) {
         self.history_write().add_assistant_message(content);
     }
 
     /// Add a system message to the chat history.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_system_message("Session started".to_string()).await;
-    /// # }
-    /// ```
-    pub async fn add_system_message(&self, content: String) {
+    pub fn add_system_message(&self, content: String) {
         self.history_write().add_system_message(content);
     }
 
     /// Get a clone of the current chat history.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_user_message("Hello".to_string()).await;
-    ///
-    /// let history = context.get_chat_history().await;
-    /// assert_eq!(history.len(), 1);
-    /// # }
-    /// ```
-    pub async fn get_chat_history(&self) -> ChatHistory {
+    pub fn get_chat_history(&self) -> ChatHistory {
         self.history_read().clone()
     }
 
     /// Clear the chat history.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_user_message("Hello".to_string()).await;
-    /// assert_eq!(context.chat_history_len().await, 1);
-    ///
-    /// context.clear_chat_history().await;
-    /// assert_eq!(context.chat_history_len().await, 0);
-    /// # }
-    /// ```
-    pub async fn clear_chat_history(&self) {
+    pub fn clear_chat_history(&self) {
         self.history_write().clear();
     }
 
     /// Get the number of messages in the chat history.
-    pub async fn chat_history_len(&self) -> usize {
+    pub fn chat_history_len(&self) -> usize {
         self.history_read().len()
     }
 
     /// Check if the chat history is empty.
-    pub async fn is_chat_history_empty(&self) -> bool {
+    pub fn is_chat_history_empty(&self) -> bool {
         self.history_read().is_empty()
     }
 
-    /// Get the last N messages from chat history.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_user_message("Message 1".to_string()).await;
-    /// context.add_user_message("Message 2".to_string()).await;
-    /// context.add_user_message("Message 3".to_string()).await;
-    ///
-    /// let last_two = context.get_last_messages(2).await;
-    /// assert_eq!(last_two.len(), 2);
-    /// assert_eq!(last_two[0].content, "Message 2");
-    /// assert_eq!(last_two[1].content, "Message 3");
-    /// # }
-    /// ```
-    pub async fn get_last_messages(&self, n: usize) -> Vec<SerializableMessage> {
-        self.history_read().last_messages(n).to_vec()
+    /// Get the last N messages from chat history, oldest first.
+    pub fn get_last_messages(&self, n: usize) -> Vec<SerializableMessage> {
+        self.history_read().last_messages(n).cloned().collect()
     }
 
-    /// Get all messages from chat history as SerializableMessage.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_user_message("Hello".to_string()).await;
-    /// context.add_assistant_message("Hi there!".to_string()).await;
-    ///
-    /// let all_messages = context.get_all_messages().await;
-    /// assert_eq!(all_messages.len(), 2);
-    /// # }
-    /// ```
-    pub async fn get_all_messages(&self) -> Vec<SerializableMessage> {
-        self.history_read().messages().to_vec()
+    /// Get all messages from chat history, oldest first.
+    pub fn get_all_messages(&self) -> Vec<SerializableMessage> {
+        self.history_read().messages().cloned().collect()
     }
 
     // Rig integration methods (only available when rig feature is enabled)
@@ -816,63 +526,16 @@ impl Context {
     /// Get all chat history messages converted to rig::completion::Message format.
     ///
     /// This method is only available when the "rig" feature is enabled.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "rig")]
-    /// # {
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// context.add_user_message("Hello".to_string()).await;
-    /// context.add_assistant_message("Hi there!".to_string()).await;
-    ///
-    /// let rig_messages = context.get_rig_messages().await;
-    /// assert_eq!(rig_messages.len(), 2);
-    /// # }
-    /// # }
-    /// ```
-    pub async fn get_rig_messages(&self) -> Vec<Message> {
-        self.get_all_messages()
-            .await
-            .into_iter()
-            .map(Message::from)
-            .collect()
+    pub fn get_rig_messages(&self) -> Vec<Message> {
+        self.get_all_messages().into_iter().map(Message::from).collect()
     }
 
     #[cfg(feature = "rig")]
     /// Get the last N messages converted to rig::completion::Message format.
     ///
     /// This method is only available when the "rig" feature is enabled.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "rig")]
-    /// # {
-    /// use graph_flow::Context;
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// let context = Context::new();
-    /// for i in 0..10 {
-    ///     context.add_user_message(format!("Message {}", i)).await;
-    /// }
-    ///
-    /// let last_5 = context.get_last_rig_messages(5).await;
-    /// assert_eq!(last_5.len(), 5);
-    /// # }
-    /// # }
-    /// ```
-    pub async fn get_last_rig_messages(&self, n: usize) -> Vec<Message> {
-        self.get_last_messages(n)
-            .await
-            .into_iter()
-            .map(Message::from)
-            .collect()
+    pub fn get_last_rig_messages(&self, n: usize) -> Vec<Message> {
+        self.get_last_messages(n).into_iter().map(Message::from).collect()
     }
 }
 
@@ -939,87 +602,94 @@ impl<'de> Deserialize<'de> for Context {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_basic_context_operations() {
+    #[test]
+    fn test_basic_context_operations() {
         let context = Context::new();
 
-        context.set("key", "value").await;
-        let value: Option<String> = context.get("key").await;
+        context.set("key", "value").unwrap();
+        let value: Option<String> = context.get("key");
         assert_eq!(value, Some("value".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_chat_history_operations() {
+    #[test]
+    fn test_set_unserializable_value_errors() {
+        use std::collections::HashMap;
         let context = Context::new();
 
-        assert!(context.is_chat_history_empty().await);
-        assert_eq!(context.chat_history_len().await, 0);
-
-        context.add_user_message("Hello".to_string()).await;
-        context.add_assistant_message("Hi there!".to_string()).await;
-
-        assert!(!context.is_chat_history_empty().await);
-        assert_eq!(context.chat_history_len().await, 2);
-
-        let history = context.get_chat_history().await;
-        assert_eq!(history.len(), 2);
-        assert_eq!(history.messages()[0].content, "Hello");
-        assert_eq!(history.messages()[0].role, MessageRole::User);
-        assert_eq!(history.messages()[1].content, "Hi there!");
-        assert_eq!(history.messages()[1].role, MessageRole::Assistant);
+        // Maps with non-string keys cannot be represented in JSON
+        let bad: HashMap<Vec<u8>, String> = HashMap::from([(vec![1u8], "x".to_string())]);
+        assert!(context.set("bad", bad).is_err());
     }
 
-    #[tokio::test]
-    async fn test_chat_history_max_messages() {
+    #[test]
+    fn test_chat_history_operations() {
+        let context = Context::new();
+
+        assert!(context.is_chat_history_empty());
+        assert_eq!(context.chat_history_len(), 0);
+
+        context.add_user_message("Hello".to_string());
+        context.add_assistant_message("Hi there!".to_string());
+
+        assert!(!context.is_chat_history_empty());
+        assert_eq!(context.chat_history_len(), 2);
+
+        let history = context.get_chat_history();
+        assert_eq!(history.len(), 2);
+        let messages: Vec<_> = history.messages().collect();
+        assert_eq!(messages[0].content, "Hello");
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[1].content, "Hi there!");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn test_chat_history_max_messages() {
         let context = Context::with_max_chat_messages(2);
 
-        context.add_user_message("Message 1".to_string()).await;
-        context
-            .add_assistant_message("Response 1".to_string())
-            .await;
-        context.add_user_message("Message 2".to_string()).await;
+        context.add_user_message("Message 1".to_string());
+        context.add_assistant_message("Response 1".to_string());
+        context.add_user_message("Message 2".to_string());
 
-        let history = context.get_chat_history().await;
+        let history = context.get_chat_history();
         assert_eq!(history.len(), 2);
-        assert_eq!(history.messages()[0].content, "Response 1");
-        assert_eq!(history.messages()[1].content, "Message 2");
+        let messages: Vec<_> = history.messages().collect();
+        assert_eq!(messages[0].content, "Response 1");
+        assert_eq!(messages[1].content, "Message 2");
     }
 
-    #[tokio::test]
-    async fn test_last_messages() {
+    #[test]
+    fn test_last_messages() {
         let context = Context::new();
 
-        context.add_user_message("Message 1".to_string()).await;
-        context
-            .add_assistant_message("Response 1".to_string())
-            .await;
-        context.add_user_message("Message 2".to_string()).await;
-        context
-            .add_assistant_message("Response 2".to_string())
-            .await;
+        context.add_user_message("Message 1".to_string());
+        context.add_assistant_message("Response 1".to_string());
+        context.add_user_message("Message 2".to_string());
+        context.add_assistant_message("Response 2".to_string());
 
-        let last_two = context.get_last_messages(2).await;
+        let last_two = context.get_last_messages(2);
         assert_eq!(last_two.len(), 2);
         assert_eq!(last_two[0].content, "Message 2");
         assert_eq!(last_two[1].content, "Response 2");
     }
 
-    #[tokio::test]
-    async fn test_context_serialization() {
+    #[test]
+    fn test_context_serialization() {
         let context = Context::new();
-        context.set("key", "value").await;
-        context.add_user_message("test message".to_string()).await;
+        context.set("key", "value").unwrap();
+        context.add_user_message("test message".to_string());
 
         let serialized = serde_json::to_string(&context).unwrap();
         let deserialized: Context = serde_json::from_str(&serialized).unwrap();
 
-        let value: Option<String> = deserialized.get("key").await;
+        let value: Option<String> = deserialized.get("key");
         assert_eq!(value, Some("value".to_string()));
 
-        assert_eq!(deserialized.chat_history_len().await, 1);
-        let history = deserialized.get_chat_history().await;
-        assert_eq!(history.messages()[0].content, "test message");
-        assert_eq!(history.messages()[0].role, MessageRole::User);
+        assert_eq!(deserialized.chat_history_len(), 1);
+        let history = deserialized.get_chat_history();
+        let first = history.messages().next().unwrap();
+        assert_eq!(first.content, "test message");
+        assert_eq!(first.role, MessageRole::User);
     }
 
     #[test]
@@ -1045,22 +715,30 @@ mod tests {
         let deserialized: ChatHistory = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(deserialized.len(), 2);
-        assert_eq!(deserialized.messages()[0].content, "Hello");
-        assert_eq!(deserialized.messages()[1].content, "Hi!");
+        let messages: Vec<_> = deserialized.messages().collect();
+        assert_eq!(messages[0].content, "Hello");
+        assert_eq!(messages[1].content, "Hi!");
+    }
+
+    #[test]
+    fn test_chat_history_json_compat_with_0_5() {
+        // 0.5 serialized `messages` as a JSON array from a Vec; the VecDeque
+        // representation must remain interchangeable.
+        let json = r#"{"messages":[{"role":"User","content":"hi","timestamp":"2026-01-01T00:00:00Z"}],"max_messages":1000}"#;
+        let history: ChatHistory = serde_json::from_str(json).unwrap();
+        assert_eq!(history.len(), 1);
     }
 
     #[cfg(feature = "rig")]
-    #[tokio::test]
-    async fn test_rig_integration() {
+    #[test]
+    fn test_rig_integration() {
         let context = Context::new();
 
-        context.add_user_message("Hello".to_string()).await;
-        context.add_assistant_message("Hi there!".to_string()).await;
-        context
-            .add_system_message("System message".to_string())
-            .await;
+        context.add_user_message("Hello".to_string());
+        context.add_assistant_message("Hi there!".to_string());
+        context.add_system_message("System message".to_string());
 
-        let rig_messages = context.get_rig_messages().await;
+        let rig_messages = context.get_rig_messages();
         assert_eq!(rig_messages.len(), 3);
 
         // Verify each message maps to the correct rig variant.
@@ -1081,7 +759,7 @@ mod tests {
         );
 
         // Verify get_last_rig_messages tail ordering when the tail includes a system message.
-        let last_two = context.get_last_rig_messages(2).await;
+        let last_two = context.get_last_rig_messages(2);
         assert_eq!(last_two.len(), 2);
         assert!(
             matches!(&last_two[0], Message::Assistant { .. }),

@@ -12,7 +12,7 @@ struct Consume;
 impl Task for Prepare {
     fn id(&self) -> &str { "prepare" }
     async fn run(&self, ctx: Context) -> graph_flow::Result<TaskResult> {
-        ctx.set("input", "hello".to_string()).await;
+        ctx.set("input", "hello".to_string())?;
         Ok(TaskResult::new(Some("prepared".to_string()), NextAction::Continue))
     }
 }
@@ -21,8 +21,8 @@ impl Task for Prepare {
 impl Task for ChildA {
     fn id(&self) -> &str { "child_a" }
     async fn run(&self, ctx: Context) -> graph_flow::Result<TaskResult> {
-        let inp: String = ctx.get("input").await.unwrap_or_default();
-        ctx.set("a_out", format!("{}-A", inp)).await;
+        let inp: String = ctx.get("input").unwrap_or_default();
+        ctx.set("a_out", format!("{}-A", inp))?;
         Ok(TaskResult::new(Some("A done".to_string()), NextAction::End))
     }
 }
@@ -31,8 +31,8 @@ impl Task for ChildA {
 impl Task for ChildB {
     fn id(&self) -> &str { "child_b" }
     async fn run(&self, ctx: Context) -> graph_flow::Result<TaskResult> {
-        let inp: String = ctx.get("input").await.unwrap_or_default();
-        ctx.set("b_out", format!("{}-B", inp)).await;
+        let inp: String = ctx.get("input").unwrap_or_default();
+        ctx.set("b_out", format!("{}-B", inp))?;
         Ok(TaskResult::new(Some("B done".to_string()), NextAction::End))
     }
 }
@@ -42,8 +42,8 @@ impl Task for Consume {
     fn id(&self) -> &str { "consume" }
     async fn run(&self, ctx: Context) -> graph_flow::Result<TaskResult> {
         // Read aggregated responses stored by the fanout task
-        let a_resp: Option<String> = ctx.get("fanout.child_a.response").await;
-        let b_resp: Option<String> = ctx.get("fanout.child_b.response").await;
+        let a_resp: Option<String> = ctx.get("fanout.child_a.response");
+        let b_resp: Option<String> = ctx.get("fanout.child_b.response");
         let final_msg = format!("A={:?}, B={:?}", a_resp, b_resp);
         Ok(TaskResult::new(Some(final_msg), NextAction::End))
     }
@@ -64,7 +64,7 @@ async fn main() -> graph_flow::Result<()> {
             .add_task(consume.clone())
             .add_edge(prepare.id(), fanout.id())
             .add_edge(fanout.id(), consume.id())
-            .build(),
+            .build()?,
     );
 
     // Session and runner

@@ -71,7 +71,10 @@ async fn recommend(
 
     // Set up context with chat history limit
     let context = Context::with_max_chat_messages(50);
-    context.set("user_query", params.query.clone()).await;
+    context.set("user_query", params.query.clone()).map_err(|e| {
+        error!("Failed to set user query: {}", e);
+        internal_error("Failed to initialize session context")
+    })?;
 
     let session = Session {
         id: session_id.clone(),
@@ -79,6 +82,7 @@ async fn recommend(
         current_task_id: refine_task_id.to_string(),
         status_message: None,
         context,
+        version: 0,
     };
 
     // Save initial session - FlowRunner will handle persistence during execution
@@ -120,10 +124,6 @@ async fn recommend(
                 "Workflow is waiting for input, which is not expected in this flow",
             ))
         }
-        ExecutionStatus::Error(e) => {
-            error!("Workflow error: {}", e);
-            Err(internal_error(&format!("Workflow failed: {}", e)))
-        }
     }
 }
 
@@ -159,11 +159,11 @@ async fn setup_graph(
             // Conditional routing: if validation passes go to delivery, else back to answer generation
             .add_conditional_edge(
                 validate_id.clone(),
-                |ctx| ctx.get_sync::<bool>("validation_passed").unwrap_or(false),
+                |ctx| ctx.get::<bool>("validation_passed").unwrap_or(false),
                 deliver_id.clone(),
                 answer_id.clone(), // Back to answer generation for retry
             )
-            .build(),
+            .build()?,
     );
 
     graph_storage
@@ -197,8 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get the graph for FlowRunner
     let graph = graph_storage
-        .get("recommendation_flow")
-        .await?
+        .get("recommendation_flow").await?
         .ok_or("recommendation_flow graph not found")?;
 
     // Create FlowRunner

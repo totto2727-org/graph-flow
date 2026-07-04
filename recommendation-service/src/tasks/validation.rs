@@ -20,15 +20,15 @@ impl Task for ValidationTask {
         info!("Starting validation task");
 
         let answer: String = context
-            .get_sync("answer")
+            .get("answer")
             .ok_or_else(|| TaskExecutionFailed("answer not found in context".into()))?;
 
         let user_query: String = context
-            .get_sync("user_query")
+            .get("user_query")
             .ok_or_else(|| TaskExecutionFailed("user_query not found in context".into()))?;
 
         let retry_count: u32 = context
-            .get_sync("retry_count")
+            .get("retry_count")
             .ok_or_else(|| TaskExecutionFailed("retry_count not found in context".into()))?;
 
         info!(
@@ -78,8 +78,7 @@ impl Task for ValidationTask {
             })?;
 
         context
-            .set("validation_passed", &validation_result.passed)
-            .await;
+            .set("validation_passed", &validation_result.passed)?;
         if validation_result.passed {
             info!("Validation passed");
             return Ok(TaskResult::new(None, NextAction::ContinueAndExecute));
@@ -108,10 +107,10 @@ impl Task for ValidationTask {
         // we still have another chance to try
         // add the comment to the chat history with a explanation of what went wrong
         let validation_message = format!("The answer is not good enough. Reason: {}", comment);
-        context.add_user_message(validation_message).await;
+        context.add_user_message(validation_message);
 
         // Increment retry count for the next attempt
-        context.set("retry_count", retry_count + 1).await;
+        context.set("retry_count", retry_count + 1)?;
         Ok(TaskResult::new(None, NextAction::ContinueAndExecute))
     }
 } 

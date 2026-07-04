@@ -15,7 +15,7 @@ impl Task for QueryRefinementTask {
     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
         info!("Starting query refinement task");
         let user_query: String = context
-            .get_sync("user_query")
+            .get("user_query")
             .ok_or_else(|| TaskExecutionFailed("user_query not found in context".into()))?;
 
         info!("Original user query: {}", user_query);
@@ -39,9 +39,9 @@ impl Task for QueryRefinementTask {
             .to_string();
 
         info!("Refined query: {}", refined);
-        context.set("refined_query", refined.clone()).await;
+        context.set("refined_query", refined.clone())?;
         // Initialize retry count
-        context.set("retry_count", 0u32).await;
+        context.set("retry_count", 0u32)?;
 
         Ok(TaskResult::new(None, NextAction::ContinueAndExecute))
     }

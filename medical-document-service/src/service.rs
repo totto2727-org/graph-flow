@@ -122,7 +122,9 @@ async fn start_analysis(
 
     validate_pdf_path(&request.pdf_path)?;
 
-    let session = create_medical_analysis_session(request.pdf_path.clone()).await;
+    let session = create_medical_analysis_session(request.pdf_path.clone())
+        .await
+        .map_err(|e| internal_error("Failed to create analysis session", &e.to_string()))?;
     let session_id = session.id.clone();
 
     save_session(&state, session).await?;
@@ -156,7 +158,7 @@ async fn start_workflow(state: &AppState, session_id: &str) -> ApiResult<Value> 
             // If workflow completed immediately, update session to reflect completion
             if matches!(result.status, ExecutionStatus::Completed) {
                 if let Ok(Some(mut session)) = state.session_storage.get(session_id).await {
-                    session.context.set("workflow_completed", true).await;
+                    let _ = session.context.set("workflow_completed", true);
                     session.current_task_id = "completed".to_string();
                     if let Err(e) = state.session_storage.save(session).await {
                         error!(
@@ -195,13 +197,11 @@ async fn get_session_status(
             let waiting_for_feedback = session
                 .context
                 .get("waiting_for_human_feedback")
-                .await
                 .unwrap_or(false);
 
             let workflow_completed = session
                 .context
                 .get("workflow_completed")
-                .await
                 .unwrap_or(false);
 
             // Determine the actual status based on workflow state
@@ -237,7 +237,7 @@ async fn build_context_map(
 ) -> std::collections::HashMap<String, serde_json::Value> {
     let mut context_map = std::collections::HashMap::new();
 
-    if let Some(document) = session.context.get::<MedicalDocument>("document").await {
+    if let Some(document) = session.context.get::<MedicalDocument>("document") {
         context_map.insert(
             "document".to_string(),
             serde_json::to_value(&document).unwrap_or(serde_json::Value::Null),
@@ -284,7 +284,8 @@ async fn provide_feedback(
 
     match state.session_storage.get(&session_id).await {
         Ok(Some(session)) => {
-            update_session_with_feedback(&session, &request.feedback).await;
+            update_session_with_feedback(&session, &request.feedback)
+                .map_err(|e| internal_error("Failed to record feedback", &e.to_string()))?;
             save_session_after_feedback(&state, session).await?;
             resume_workflow_with_feedback(&state, &session_id).await
         }
@@ -303,22 +304,24 @@ fn validate_feedback(feedback: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn update_session_with_feedback(session: &graph_flow::Session, feedback: &str) {
+fn update_session_with_feedback(
+    session: &graph_flow::Session,
+    feedback: &str,
+) -> graph_flow::Result<()> {
     session
         .context
-        .set("human_feedback", feedback.to_string())
-        .await;
+        .set("human_feedback", feedback.to_string())?;
 
     // Clear the waiting flag since feedback has been provided
     session
         .context
-        .set("waiting_for_human_feedback", false)
-        .await;
+        .set("waiting_for_human_feedback", false)?;
 
-    if let Some(mut document) = session.context.get::<MedicalDocument>("document").await {
+    if let Some(mut document) = session.context.get::<MedicalDocument>("document") {
         document.human_feedback = Some(feedback.to_string());
-        session.context.set("document", document).await;
+        session.context.set("document", document)?;
     }
+    Ok(())
 }
 
 async fn save_session_after_feedback(
@@ -342,7 +345,7 @@ async fn resume_workflow_with_feedback(state: &AppState, session_id: &str) -> Ap
             // If workflow completed, update session to reflect completion
             if matches!(result.status, ExecutionStatus::Completed) {
                 if let Ok(Some(mut session)) = state.session_storage.get(session_id).await {
-                    session.context.set("workflow_completed", true).await;
+                    let _ = session.context.set("workflow_completed", true);
                     session.current_task_id = "completed".to_string();
                     if let Err(e) = state.session_storage.save(session).await {
                         error!(

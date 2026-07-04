@@ -20,15 +20,15 @@ impl Task for AnswerGenerationTask {
         info!("Starting answer generation task");
 
         let user_query: String = context
-            .get_sync("user_query")
+            .get("user_query")
             .ok_or_else(|| TaskExecutionFailed("user_query not found in context".into()))?;
 
         let ctx: String = context
-            .get_sync("retrieved_context")
+            .get("retrieved_context")
             .ok_or_else(|| TaskExecutionFailed("retrieved_context not found in context".into()))?;
 
         let retry_count: u32 = context
-            .get_sync("retry_count")
+            .get("retry_count")
             .ok_or_else(|| TaskExecutionFailed("retry_count not found in context".into()))?;
 
         info!(
@@ -38,7 +38,7 @@ impl Task for AnswerGenerationTask {
         );
 
         // Get the full chat history for conversational memory
-        let history = context.get_rig_messages().await;
+        let history = context.get_rig_messages();
 
         let agent = get_llm_agent()
             .map_err(|e| TaskExecutionFailed(format!("Failed to initialize LLM agent: {}", e)))?;
@@ -77,11 +77,10 @@ impl Task for AnswerGenerationTask {
         info!("Answer generated: {}", answer);
 
         // Add the current answer attempt to chat history
-        context.add_user_message(prompt).await;
+        context.add_user_message(prompt);
         context
-            .add_assistant_message(format!("Attempt {}: {}", retry_count + 1, answer))
-            .await;
-        context.set("answer", answer.clone()).await;
+            .add_assistant_message(format!("Attempt {}: {}", retry_count + 1, answer));
+        context.set("answer", answer.clone())?;
 
         Ok(TaskResult::new(Some(answer), NextAction::ContinueAndExecute))
     }

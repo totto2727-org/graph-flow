@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create context and add the document
     let context = Context::new();
-    context.set("document", sample_document).await;
+    context.set("document", sample_document)?;
 
     info!("Context prepared, running research search task...");
 
@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Retrieve the updated document from context
-            if let Some(updated_document) = context.get::<MedicalDocument>("document").await {
+            if let Some(updated_document) = context.get::<MedicalDocument>("document") {
                 info!("\n=== RESEARCH SEARCH RESULTS ===");
 
                 if let Some(keywords) = &updated_document.research_keywords {

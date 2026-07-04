@@ -45,7 +45,7 @@ impl Task for SentimentAnalysisTask {
     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
         // Pull the user input we stored in the session context
         let user_input: String = context
-            .get_sync("user_input")
+            .get("user_input")
             .unwrap_or_else(|| "".to_string());
 
         // Build the LLM agent
@@ -70,14 +70,14 @@ impl Task for SentimentAnalysisTask {
             let sentiment = parsed.sentiment;
             info!(sentiment, "Sentiment detected – continuing");
             // Persist the sentiment in the context so that the conditional edge can read it.
-            context.set("sentiment", sentiment.clone()).await;
+            context.set("sentiment", sentiment.clone())?;
 
             // We want to proceed straight to the next task and execute it immediately.
             return Ok(TaskResult::new(None, NextAction::ContinueAndExecute));
         }
 
         // If we are here the model did not return the expected JSON – treat its reply as a clarifying question.
-        context.add_assistant_message(response.clone()).await;
+        context.add_assistant_message(response.clone());
         Ok(TaskResult::new(
             Some(response),
             NextAction::WaitForInput, // Wait for the user to answer the clarifying question.
@@ -98,7 +98,7 @@ impl SentimentAnalysisTask {
         } else {
             "negative"
         };
-        context.set("sentiment", sentiment.to_string()).await;
+        context.set("sentiment", sentiment.to_string())?;
         Ok(TaskResult::new(None, NextAction::Continue))
     }
 }
@@ -168,14 +168,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sentiment_id.clone(),
                 |context| {
                     context
-                        .get_sync::<String>("sentiment")
+                        .get::<String>("sentiment")
                         .map(|s| s == "positive")
                         .unwrap_or(false)
                 },
                 positive_id.clone(),
                 negative_id.clone(),
             )
-            .build(),
+            .build()?,
     );
 
     graph_storage
@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Session::new_from_task(session_id.clone(), &sentiment_id);
 
     // Seed the session context with the user input gathered on the command line
-    session.context.set("user_input", user_input.clone()).await;
+    session.context.set("user_input", user_input.clone())?;
 
     // Persist the session before we start executing the graph
     session_storage.save(session.clone()).await?;
@@ -216,10 +216,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExecutionStatus::WaitingForInput => {
                 info!("Waiting for user input, continuing...");
                 continue;
-            }
-            ExecutionStatus::Error(e) => {
-                eprintln!("Error: {}", e);
-                break;
             }
         }
     }

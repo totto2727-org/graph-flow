@@ -16,11 +16,11 @@ impl Task for DeliveryTask {
         info!("Starting delivery task");
 
         let answer: String = context
-            .get_sync("answer")
+            .get("answer")
             .ok_or_else(|| TaskExecutionFailed("answer not found in context".into()))?;
 
         let retry_count: u32 = context
-            .get_sync("retry_count")
+            .get("retry_count")
             .ok_or_else(|| TaskExecutionFailed("retry_count not found in context".into()))?;
 
         info!("Delivering final answer after {} retries", retry_count);

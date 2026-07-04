@@ -14,7 +14,6 @@ impl Task for SummaryIntegrationTask {
 
         let document: MedicalDocument = context
             .get("document")
-            .await
             .ok_or_else(|| GraphError::ContextError("Document not found in context".to_string()))?;
 
         let initial_summary = document
@@ -45,7 +44,7 @@ impl Task for SummaryIntegrationTask {
         // Update document with integrated summary
         let mut updated_document = document;
         updated_document.integrated_summary = Some(integrated_summary);
-        context.set("document", updated_document).await;
+        context.set("document", updated_document)?;
 
         info!("Summary integration completed successfully");
 

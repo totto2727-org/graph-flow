@@ -13,10 +13,10 @@ struct HelloTask;
 #[async_trait]
 impl Task for HelloTask {
     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-        let name: String = context.get_sync("name").unwrap();
+        let name: String = context.get("name").unwrap();
         let greeting = format!("Hello, {}", name);
         // Store result for next task
-        context.set("greeting", greeting.clone()).await;
+        context.set("greeting", greeting.clone())?;
 
         // using NextAction::Continue to indicate we want to proceed to the next task,
         // but we want to advance just one step and give control back to the workflow manager
@@ -31,7 +31,7 @@ struct ExcitementTask;
 #[async_trait]
 impl Task for ExcitementTask {
     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-        let greeting: String = context.get_sync("greeting").unwrap();
+        let greeting: String = context.get("greeting").unwrap();
         let excited = format!("{} !!!", greeting);
 
         Ok(TaskResult::new(Some(excited), NextAction::End))
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_task(hello_task)
             .add_task(excitement_task)
             .add_edge(&hello_task_id, &excitement_task_id) // Connect the tasks
-            .build(),
+            .build()?,
     );
 
     // Store the graph in graph storage
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Session::new_from_task(session_id.clone(), &hello_task_id);
 
     // Set up context with input data
-    session.context.set("name", "Batman".to_string()).await;
+    session.context.set("name", "Batman".to_string())?;
     // Save the session
     session_storage.save(session.clone()).await?;
 
@@ -102,17 +102,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Workflow waiting for user input – continuing...\n");
                 continue;
             }
-            ExecutionStatus::Error(err) => {
-                println!("Error occurred: {}", err);
-                break;
-            }
         }
     }
 
     // Demonstrate session persistence by retrieving final session
     let final_session = session_storage
-        .get(&session_id)
-        .await?
+        .get(&session_id).await?
         .ok_or("Session not found")?;
 
     println!("\nFinal session state:");
@@ -123,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Demonstrate retrieving stored values from context
-    if let Some(greeting) = final_session.context.get::<String>("greeting").await {
+    if let Some(greeting) = final_session.context.get::<String>("greeting") {
         println!("Stored greeting: {}", greeting);
     }
 

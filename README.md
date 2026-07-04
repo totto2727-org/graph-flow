@@ -35,7 +35,7 @@ You get LangGraph-style workflow design with Rust's performance and type safety,
 
 ```toml
 [dependencies]
-graph-flow = { version = "0.5", features = ["rig"] }  # drop "rig" if you don't need LLM helpers
+graph-flow = { version = "0.6", features = ["rig"] }  # drop "rig" if you don't need LLM helpers
 ```
 
 ### 1. Define tasks
@@ -53,11 +53,11 @@ impl Task for HelloTask {
     // id() defaults to the type name; override it for a custom identifier
 
     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-        let name: String = context.get("name").await.unwrap_or_default();
+        let name: String = context.get("name").unwrap_or_default();
         let greeting = format!("Hello, {name}");
 
         // Store result for the next task
-        context.set("greeting", greeting.clone()).await;
+        context.set("greeting", greeting.clone())?;
 
         // Continue to the next task, but hand control back to the caller
         Ok(TaskResult::new(Some(greeting), NextAction::Continue))
@@ -79,7 +79,7 @@ let graph = Arc::new(
         .add_task(hello_task.clone())
         .add_task(excitement_task.clone())
         .add_edge(hello_task.id(), excitement_task.id())
-        .build(),
+        .build()?, // validates edges and start task
 );
 ```
 
@@ -96,7 +96,7 @@ let runner = FlowRunner::new(graph.clone(), storage.clone());
 
 // Create a session positioned at the first task
 let session = Session::new_from_task("session_001".to_string(), hello_task.id());
-session.context.set("name", "Batman".to_string()).await;
+session.context.set("name", "Batman".to_string())?;
 storage.save(session).await?;
 
 // Drive the workflow step by step
@@ -106,12 +106,8 @@ loop {
 
     match result.status {
         ExecutionStatus::Completed => break,
-        ExecutionStatus::Paused { .. } => continue,      // will auto-continue to the next task
-        ExecutionStatus::WaitingForInput => break,        // collect user input, set it in context, run again
-        ExecutionStatus::Error(e) => {
-            eprintln!("workflow error: {e}");
-            break;
-        }
+        ExecutionStatus::Paused { .. } => continue,   // will auto-continue to the next task
+        ExecutionStatus::WaitingForInput => break,    // collect user input, set it in context, run again
     }
 }
 ```
@@ -155,7 +151,8 @@ Every execution returns an [`ExecutionResult`](graph-flow/src/graph.rs) with the
 - **`Paused { next_task_id, reason }`** — task finished; the workflow will proceed to `next_task_id` on the next run (returned for `Continue` and `GoTo`)
 - **`WaitingForInput`** — workflow is parked on the current task until you provide input and run again
 - **`Completed`** — the workflow reached `End`
-- **`Error(String)`** — reserved for API compatibility; the engine currently reports failures as `Err(GraphError)` instead
+
+Failures are reported as `Err(GraphError)` from the execution call itself.
 
 ### Guard rails
 
@@ -166,7 +163,7 @@ let graph = GraphBuilder::new("wf")
     .add_task(task)
     .with_task_timeout(std::time::Duration::from_secs(60)) // per-task timeout (default: 5 min)
     .with_max_execution_steps(50) // cap chained ContinueAndExecute steps (default: unlimited)
-    .build();
+    .build()?;
 ```
 
 `with_max_execution_steps` turns an accidental `ContinueAndExecute` cycle into an error instead of an infinite loop.
@@ -184,11 +181,11 @@ let graph = GraphBuilder::new("sentiment_flow")
     .add_task(negative_task.clone())
     .add_conditional_edge(
         sentiment_task.id(),
-        |ctx| ctx.get_sync::<String>("sentiment").map(|s| s == "positive").unwrap_or(false),
+        |ctx| ctx.get::<String>("sentiment").map(|s| s == "positive").unwrap_or(false),
         positive_task.id(), // yes branch
         negative_task.id(), // else branch
     )
-    .build();
+    .build()?;
 ```
 
 ```mermaid
@@ -206,7 +203,7 @@ With the `rig` feature, chat history stored in the `Context` converts directly t
 use rig::providers::openrouter;
 
 async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-    let user_input: String = context.get_sync("user_input").unwrap();
+    let user_input: String = context.get("user_input").unwrap();
 
     let client = openrouter::Client::new(&api_key);
     let agent = client
@@ -215,12 +212,12 @@ async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
         .build();
 
     // Conversation context for the LLM
-    let chat_history = context.get_rig_messages().await;
+    let chat_history = context.get_rig_messages();
     let response = agent.chat(&user_input, chat_history).await?;
 
     // Persist the exchange
-    context.add_user_message(user_input).await;
-    context.add_assistant_message(response.clone()).await;
+    context.add_user_message(user_input);
+    context.add_assistant_message(response.clone());
 
     Ok(TaskResult::new(Some(response), NextAction::Continue))
 }
@@ -230,21 +227,20 @@ async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
 
 [`Context`](graph-flow/src/context.rs) is thread-safe, typed, and fully serialized with the session:
 
+All `Context` methods are synchronous (the store is an in-memory map), so the same calls work in async tasks and in edge-condition closures:
+
 ```rust
-// Typed key-value state
-context.set("claim_amount", 1500.0).await;
-let amount: f64 = context.get("claim_amount").await.unwrap();
+// Typed key-value state; set() is fallible (serialization can fail)
+context.set("claim_amount", 1500.0)?;
+let amount: f64 = context.get("claim_amount").unwrap();
 
-// Fallible insert (set() panics on unserializable values)
-context.try_set("key", value).await?;
+// Works directly in edge conditions
+let ok = context.get::<bool>("condition").unwrap_or(false);
 
-// Sync accessors for edge-condition closures
-let ok = context.get_sync::<bool>("condition").unwrap_or(false);
-
-// Built-in chat history (capped at 1000 messages by default)
-context.add_user_message("What's my claim status?".to_string()).await;
-context.add_assistant_message("Your claim is being processed".to_string()).await;
-let recent = context.get_last_messages(5).await;
+// Built-in chat history (ring buffer, capped at 1000 messages by default)
+context.add_user_message("What's my claim status?".to_string());
+context.add_assistant_message("Your claim is being processed".to_string());
+let recent = context.get_last_messages(5);
 ```
 
 ### Parallel execution (FanOut)
@@ -264,7 +260,7 @@ let graph = GraphBuilder::new("fanout_demo")
     .add_task(consume_task.clone())
     .add_edge(prepare_task.id(), fanout.id())
     .add_edge(fanout.id(), consume_task.id())
-    .build();
+    .build()?;
 
 // Downstream tasks read: parallel.child_a.response, parallel.child_b.response, ...
 ```
@@ -279,7 +275,7 @@ Both backends implement the same `SessionStorage` trait — swap freely between 
 // In-memory (development)
 let storage = Arc::new(InMemorySessionStorage::new());
 
-// PostgreSQL (production) - session ids must be valid UUIDs
+// PostgreSQL (production)
 let storage = Arc::new(PostgresSessionStorage::connect(&database_url).await?);
 
 // Or bring your own pool configuration
@@ -348,7 +344,10 @@ async fn execute_graph(
 ) -> Result<Json<ExecuteResponse>, StatusCode> {
     // Store the user's message in the session context
     let session = state.session_storage.get(&session_id).await?;
-    session.context.set("user_input", request.content).await;
+    session
+        .context
+        .set("user_input", request.content)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state.session_storage.save(session).await?;
 
     // Execute one step; FlowRunner loads, runs, and saves the session
@@ -364,14 +363,13 @@ async fn execute_graph(
 
 ## Production Considerations
 
-- **Per-session concurrency**: `FlowRunner::run` is a load → execute → save cycle with no locking. Two concurrent runs of the *same* session race and the later save wins. Serialize requests per session (per-session mutex, sticky routing, or a queue).
+- **Per-session concurrency**: sessions carry an optimistic-locking version. If two runs of the same session race, the losing save fails with `GraphError::SessionConflict` instead of silently overwriting — reload and retry on conflict. Task side effects from the losing attempt are not rolled back, so keep tasks idempotent if concurrent runs are possible.
 - **Timeouts and step limits**: set `with_task_timeout` to bound slow LLM calls, and `with_max_execution_steps` if your graph contains cycles reachable via `ContinueAndExecute`.
-- **Postgres session ids** must be valid UUIDs (the schema stores them as `UUID`).
 - **Durability of chained steps**: within one `ContinueAndExecute` chain, the session is saved only after the chain finishes — a crash mid-chain re-runs from the chain's first task.
 
 ## API Stability
 
-The `0.5.x` line is semver-stable. A set of known API cleanups (unifying execution semantics, fallible `Context::set`, removing dead enum variants, an immutable `Graph`, optimistic locking for Postgres) is planned for the next major release and documented in [`graph-flow/ROADMAP.md`](graph-flow/ROADMAP.md). Deprecated items (`Graph::execute`, `NextAction::GoBack`) emit compiler warnings with migration hints.
+`0.6.0` completed the API cleanup planned during the 0.5 engine review: synchronous fallible `Context` methods, validated immutable graphs (`build()` returns `Result`), optimistic session locking, and removal of the deprecated `Graph::execute`, `NextAction::GoBack`, and `ExecutionStatus::Error`. The full list and a **0.5 → 0.6 migration guide** live in [`graph-flow/ROADMAP.md`](graph-flow/ROADMAP.md).
 
 ## License
 
