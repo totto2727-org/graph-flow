@@ -63,11 +63,10 @@ impl Task for CarInsuranceDetailsTask {
 
         let user_input: String = context
             .get(session_keys::USER_INPUT)
-            .await
             .ok_or_else(|| GraphError::ContextError("user_input not found".to_string()))?;
 
         // Get message history from context in rig format
-        let chat_history = context.get_rig_messages().await;
+        let chat_history = context.get_rig_messages();
 
         // Create agent with car details collection prompt
         let agent = get_llm_agent(CAR_INSURANCE_DETAILS_PROMPT)?;
@@ -79,7 +78,7 @@ impl Task for CarInsuranceDetailsTask {
             .map_err(|e| GraphError::TaskExecutionFailed(e.to_string()))?;
 
         // Add user message and assistant response to chat history
-        context.add_user_message(user_input.clone()).await;
+        context.add_user_message(user_input.clone());
         // Try to parse details from response
         if let Some((description, estimated_cost, additional_info)) =
             parse_car_details_from_response(&response)
@@ -87,7 +86,6 @@ impl Task for CarInsuranceDetailsTask {
             // Get existing claim details and update them
             let mut claim_details: ClaimDetails = context
                 .get(session_keys::CLAIM_DETAILS)
-                .await
                 .unwrap_or_default();
 
             claim_details.description = Some(description.clone());
@@ -96,8 +94,7 @@ impl Task for CarInsuranceDetailsTask {
 
             // Store updated claim details
             context
-                .set(session_keys::CLAIM_DETAILS, claim_details)
-                .await;
+                .set(session_keys::CLAIM_DETAILS, claim_details)?;
 
             let status_message = format!(
                 "Car insurance details collected - Description: {}, Cost: ${:.2} - proceeding to validation",
@@ -112,7 +109,7 @@ impl Task for CarInsuranceDetailsTask {
             ));
         }
 
-        context.add_assistant_message(response.clone()).await;
+        context.add_assistant_message(response.clone());
         // If we don't have complete details, the response should be a guiding question
         let status_message =
             "Collecting car insurance details - waiting for complete description and cost estimate"

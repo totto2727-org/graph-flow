@@ -17,12 +17,10 @@ impl Task for FinalSummaryTask {
 
         let claim_details: ClaimDetails = context
             .get(session_keys::CLAIM_DETAILS)
-            .await
             .ok_or_else(|| GraphError::ContextError("claim_details not found".to_string()))?;
 
         let claim_decision: ClaimDecision = context
             .get(session_keys::CLAIM_DECISION)
-            .await
             .ok_or_else(|| GraphError::ContextError("claim_decision not found".to_string()))?;
 
         let insurance_type = claim_details.insurance_type.as_deref().unwrap_or("unknown");

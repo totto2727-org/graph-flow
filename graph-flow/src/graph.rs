@@ -1,5 +1,4 @@
-use dashmap::DashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -22,15 +21,19 @@ pub struct Edge {
     pub condition: Option<EdgeCondition>,
 }
 
-/// A graph of tasks that can be executed
+/// A graph of tasks that can be executed.
+///
+/// A `Graph` is immutable: it is assembled with [`GraphBuilder`] and validated
+/// by [`GraphBuilder::build`]. Because nothing can change after construction,
+/// lookups are plain `HashMap` reads with no locking.
 pub struct Graph {
     pub id: String,
-    tasks: DashMap<String, Arc<dyn Task>>,
+    tasks: HashMap<String, Arc<dyn Task>>,
     /// Outgoing edges indexed by source task id. Within a bucket, edges keep
     /// insertion order so the first matching conditional edge (or the first
     /// unconditional fallback) wins deterministically.
-    edges: DashMap<String, Vec<Edge>>,
-    start_task_id: Mutex<Option<String>>,
+    edges: HashMap<String, Vec<Edge>>,
+    start_task_id: Option<String>,
     task_timeout: Duration,
     /// Maximum number of chained `ContinueAndExecute` steps allowed within a
     /// single `execute_session` call. `None` (default) means unlimited.
@@ -38,103 +41,19 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Create an empty graph with the given id.
+    ///
+    /// Useful as a placeholder (e.g. in tests). Real graphs are built with
+    /// [`GraphBuilder`].
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            tasks: DashMap::new(),
-            edges: DashMap::new(),
-            start_task_id: Mutex::new(None),
+            tasks: HashMap::new(),
+            edges: HashMap::new(),
+            start_task_id: None,
             task_timeout: Duration::from_secs(300), // Default 5 minute timeout
             max_execution_steps: None,
         }
-    }
-
-    /// Set the timeout duration for task execution
-    pub fn set_task_timeout(&mut self, timeout: Duration) {
-        self.task_timeout = timeout;
-    }
-
-    /// Set the maximum number of chained `ContinueAndExecute` steps allowed
-    /// within a single `execute_session` call. Guards against accidental
-    /// infinite loops in cyclic graphs. `None` means unlimited.
-    pub fn set_max_execution_steps(&mut self, max: Option<usize>) {
-        self.max_execution_steps = max;
-    }
-
-    /// Add a task to the graph
-    pub fn add_task(&self, task: Arc<dyn Task>) -> &Self {
-        let task_id = task.id().to_string();
-        let is_first = self.tasks.is_empty();
-        self.tasks.insert(task_id.clone(), task);
-
-        // Set as start task if it's the first one
-        if is_first {
-            *self.start_task_id.lock().unwrap() = Some(task_id);
-        }
-
-        self
-    }
-
-    /// Set the starting task.
-    ///
-    /// Logs a warning and leaves the current start task unchanged if the
-    /// given task id has not been added to the graph.
-    pub fn set_start_task(&self, task_id: impl Into<String>) -> &Self {
-        let task_id = task_id.into();
-        if self.tasks.contains_key(&task_id) {
-            *self.start_task_id.lock().unwrap() = Some(task_id);
-        } else {
-            tracing::warn!(
-                task_id = %task_id,
-                "set_start_task called with unknown task id - start task unchanged"
-            );
-        }
-        self
-    }
-
-    /// Add an edge between tasks
-    pub fn add_edge(&self, from: impl Into<String>, to: impl Into<String>) -> &Self {
-        let from = from.into();
-        self.edges.entry(from.clone()).or_default().push(Edge {
-            from,
-            to: to.into(),
-            condition: None,
-        });
-        self
-    }
-
-    /// Add a conditional edge with an explicit `else` branch.
-    /// `yes` is taken when `condition(ctx)` returns `true`; otherwise `no` is chosen.
-    pub fn add_conditional_edge<F>(
-        &self,
-        from: impl Into<String>,
-        condition: F,
-        yes: impl Into<String>,
-        no: impl Into<String>,
-    ) -> &Self
-    where
-        F: Fn(&Context) -> bool + Send + Sync + 'static,
-    {
-        let from = from.into();
-        let predicate: EdgeCondition = Arc::new(condition);
-
-        let mut bucket = self.edges.entry(from.clone()).or_default();
-
-        // "yes" branch
-        bucket.push(Edge {
-            from: from.clone(),
-            to: yes.into(),
-            condition: Some(predicate),
-        });
-
-        // "else" branch (unconditional fallback)
-        bucket.push(Edge {
-            from,
-            to: no.into(),
-            condition: None,
-        });
-
-        self
     }
 
     /// Execute the graph with session management.
@@ -148,7 +67,6 @@ impl Graph {
     /// [`crate::FlowRunner::run`]) after this method returns, so context
     /// updates made by intermediate `ContinueAndExecute` steps are not durable
     /// until the whole chain finishes.
-    #[allow(deprecated)] // NextAction::GoBack must still be matched until removed
     pub async fn execute_session(&self, session: &mut Session) -> Result<ExecutionResult> {
         tracing::info!(
             graph_id = %self.id,
@@ -235,14 +153,6 @@ impl Graph {
                         },
                     });
                 }
-                NextAction::GoBack => {
-                    // Not implemented: stay at current task and wait for input
-                    session.current_task_id = result.task_id.clone();
-                    return Ok(ExecutionResult {
-                        response: result.response,
-                        status: ExecutionStatus::WaitingForInput,
-                    });
-                }
             }
         }
     }
@@ -283,53 +193,12 @@ impl Graph {
         Ok(result)
     }
 
-    /// Execute the graph starting from a specific task.
-    ///
-    /// Note that this method's `NextAction` semantics differ from
-    /// [`Graph::execute_session`]: `Continue` recurses into the next task when
-    /// the current task produced no response, and `ContinueAndExecute` stops.
-    #[deprecated(
-        since = "0.5.2",
-        note = "use execute_session (or FlowRunner::run) instead; this method's NextAction \
-                semantics are inconsistent with the documented behavior and it will be removed \
-                in a future release"
-    )]
-    pub async fn execute(&self, task_id: &str, context: Context) -> Result<TaskResult> {
-        let result = self.execute_single_task(task_id, context.clone()).await?;
-
-        // Handle next action
-        match &result.next_action {
-            NextAction::Continue => {
-                // If this task has a response, stop here and don't continue to next task
-                // This allows the response to be returned to the user
-                if result.response.is_some() {
-                    Ok(result)
-                } else {
-                    // Find the next task based on edges
-                    if let Some(next_task_id) = self.find_next_task(task_id, &context) {
-                        Box::pin(self.execute(&next_task_id, context)).await
-                    } else {
-                        Ok(result)
-                    }
-                }
-            }
-            NextAction::GoTo(target_id) => {
-                if self.tasks.contains_key(target_id) {
-                    Box::pin(self.execute(target_id, context)).await
-                } else {
-                    Err(GraphError::TaskNotFound(target_id.clone()))
-                }
-            }
-            _ => Ok(result),
-        }
-    }
-
     /// Find the next task based on edges and conditions
     pub fn find_next_task(&self, current_task_id: &str, context: &Context) -> Option<String> {
         let edges = self.edges.get(current_task_id)?;
 
         let mut fallback: Option<&Edge> = None;
-        for edge in edges.iter() {
+        for edge in edges {
             match &edge.condition {
                 Some(pred) if pred(context) => return Some(edge.to.clone()),
                 None if fallback.is_none() => fallback = Some(edge),
@@ -340,40 +209,68 @@ impl Graph {
     }
 
     /// Get the start task ID
-    pub fn start_task_id(&self) -> Option<String> {
-        self.start_task_id.lock().unwrap().clone()
+    pub fn start_task_id(&self) -> Option<&str> {
+        self.start_task_id.as_deref()
     }
 
     /// Get a task by ID
     pub fn get_task(&self, task_id: &str) -> Option<Arc<dyn Task>> {
-        self.tasks.get(task_id).map(|entry| entry.clone())
+        self.tasks.get(task_id).cloned()
     }
 }
 
-/// Builder for creating graphs
+/// Builder for creating graphs.
+///
+/// The builder owns all graph data until [`GraphBuilder::build`] validates it
+/// and produces an immutable [`Graph`].
 pub struct GraphBuilder {
-    graph: Graph,
+    id: String,
+    tasks: HashMap<String, Arc<dyn Task>>,
+    edges: HashMap<String, Vec<Edge>>,
+    /// First task added; used as the start task unless overridden.
+    first_task_id: Option<String>,
+    /// Explicit start task set via `set_start_task`.
+    start_task_id: Option<String>,
+    task_timeout: Duration,
+    max_execution_steps: Option<usize>,
 }
 
 impl GraphBuilder {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
-            graph: Graph::new(id),
+            id: id.into(),
+            tasks: HashMap::new(),
+            edges: HashMap::new(),
+            first_task_id: None,
+            start_task_id: None,
+            task_timeout: Duration::from_secs(300),
+            max_execution_steps: None,
         }
     }
 
-    pub fn add_task(self, task: Arc<dyn Task>) -> Self {
-        self.graph.add_task(task);
+    pub fn add_task(mut self, task: Arc<dyn Task>) -> Self {
+        let task_id = task.id().to_string();
+        if self.first_task_id.is_none() {
+            self.first_task_id = Some(task_id.clone());
+        }
+        self.tasks.insert(task_id, task);
         self
     }
 
-    pub fn add_edge(self, from: impl Into<String>, to: impl Into<String>) -> Self {
-        self.graph.add_edge(from, to);
+    pub fn add_edge(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        let from = from.into();
+        self.edges.entry(from.clone()).or_default().push(Edge {
+            from,
+            to: to.into(),
+            condition: None,
+        });
         self
     }
 
+    /// Add a conditional edge with an explicit `else` branch.
+    /// `yes` is taken when `condition(ctx)` returns `true`; otherwise `no` is chosen.
     pub fn add_conditional_edge<F>(
-        self,
+        mut self,
         from: impl Into<String>,
         condition: F,
         yes: impl Into<String>,
@@ -382,18 +279,36 @@ impl GraphBuilder {
     where
         F: Fn(&Context) -> bool + Send + Sync + 'static,
     {
-        self.graph.add_conditional_edge(from, condition, yes, no);
+        let from = from.into();
+        let bucket = self.edges.entry(from.clone()).or_default();
+
+        // "yes" branch
+        bucket.push(Edge {
+            from: from.clone(),
+            to: yes.into(),
+            condition: Some(Arc::new(condition)),
+        });
+
+        // "else" branch (unconditional fallback)
+        bucket.push(Edge {
+            from,
+            to: no.into(),
+            condition: None,
+        });
+
         self
     }
 
-    pub fn set_start_task(self, task_id: impl Into<String>) -> Self {
-        self.graph.set_start_task(task_id);
+    /// Set the starting task. Validated in [`GraphBuilder::build`]; defaults
+    /// to the first task added.
+    pub fn set_start_task(mut self, task_id: impl Into<String>) -> Self {
+        self.start_task_id = Some(task_id.into());
         self
     }
 
     /// Set the timeout applied to each task execution (default: 5 minutes).
     pub fn with_task_timeout(mut self, timeout: Duration) -> Self {
-        self.graph.set_task_timeout(timeout);
+        self.task_timeout = timeout;
         self
     }
 
@@ -401,47 +316,70 @@ impl GraphBuilder {
     /// `execute_session` call, guarding against infinite loops in cyclic
     /// graphs (default: unlimited).
     pub fn with_max_execution_steps(mut self, max: usize) -> Self {
-        self.graph.set_max_execution_steps(Some(max));
+        self.max_execution_steps = Some(max);
         self
     }
 
-    pub fn build(self) -> Graph {
-        // Validate the graph before returning
-        if self.graph.tasks.is_empty() {
+    /// Validate the graph and produce an immutable [`Graph`].
+    ///
+    /// # Errors
+    ///
+    /// - [`GraphError::InvalidEdge`] if an edge references a task that was
+    ///   never added
+    /// - [`GraphError::TaskNotFound`] if `set_start_task` names an unknown task
+    pub fn build(self) -> Result<Graph> {
+        if self.tasks.is_empty() {
             tracing::warn!("Building graph with no tasks");
         }
 
-        let mut connected_tasks = std::collections::HashSet::new();
-        for bucket in self.graph.edges.iter() {
-            for edge in bucket.value() {
-                connected_tasks.insert(edge.from.clone());
-                connected_tasks.insert(edge.to.clone());
-
-                // Warn about edges pointing at tasks that were never added
-                for endpoint in [&edge.from, &edge.to] {
-                    if !self.graph.tasks.contains_key(endpoint) {
-                        tracing::warn!(
-                            task_id = %endpoint,
-                            "Edge references a task that has not been added to the graph"
-                        );
-                    }
+        // Every edge endpoint must be a known task
+        let mut connected_tasks = HashSet::new();
+        for edge in self.edges.values().flatten() {
+            for endpoint in [&edge.from, &edge.to] {
+                if !self.tasks.contains_key(endpoint) {
+                    return Err(GraphError::InvalidEdge(format!(
+                        "Edge '{}' -> '{}' references task '{}' which was not added to graph '{}'",
+                        edge.from, edge.to, endpoint, self.id
+                    )));
                 }
+                connected_tasks.insert(endpoint.clone());
             }
         }
 
-        // Check for orphaned tasks (tasks with no incoming or outgoing edges)
-        if self.graph.tasks.len() > 1 {
-            for task in self.graph.tasks.iter() {
-                if !connected_tasks.contains(task.key()) {
+        // An explicit start task must exist
+        let start_task_id = match self.start_task_id {
+            Some(id) => {
+                if !self.tasks.contains_key(&id) {
+                    return Err(GraphError::TaskNotFound(format!(
+                        "Start task '{}' was not added to graph '{}'",
+                        id, self.id
+                    )));
+                }
+                Some(id)
+            }
+            None => self.first_task_id,
+        };
+
+        // Warn about orphaned tasks (no incoming or outgoing edges)
+        if self.tasks.len() > 1 {
+            for task_id in self.tasks.keys() {
+                if !connected_tasks.contains(task_id) {
                     tracing::warn!(
-                        task_id = %task.key(),
+                        task_id = %task_id,
                         "Task has no edges - it may be unreachable"
                     );
                 }
             }
         }
 
-        self.graph
+        Ok(Graph {
+            id: self.id,
+            tasks: self.tasks,
+            edges: self.edges,
+            start_task_id,
+            task_timeout: self.task_timeout,
+            max_execution_steps: self.max_execution_steps,
+        })
     }
 }
 
@@ -463,10 +401,4 @@ pub enum ExecutionStatus {
     WaitingForInput,
     /// Workflow completed successfully
     Completed,
-    /// Error occurred during execution
-    ///
-    /// Note: the engine currently reports failures via `Err(GraphError)`
-    /// rather than this variant; it is kept for API compatibility and may be
-    /// removed in a future major release.
-    Error(String),
 }

@@ -52,7 +52,6 @@ impl Task for InsuranceTypeClassifierTask {
     async fn run(&self, context: Context) -> Result<TaskResult> {
         let session_id = context
             .get::<String>("session_id")
-            .await
             .unwrap_or_else(|| "unknown".to_string());
 
         info!(
@@ -63,12 +62,11 @@ impl Task for InsuranceTypeClassifierTask {
 
         let user_input: String = context
             .get(session_keys::USER_INPUT)
-            .await
             .ok_or_else(|| GraphError::ContextError("user_input not found".to_string()))?;
 
         // Get message history from context in rig format
-        let chat_history = context.get_rig_messages().await;
-        context.add_user_message(user_input.clone()).await;
+        let chat_history = context.get_rig_messages();
+        context.add_user_message(user_input.clone());
 
         // Create agent with classification prompt
         let agent = get_llm_agent(INSURANCE_TYPE_PROMPT)?;
@@ -85,18 +83,15 @@ impl Task for InsuranceTypeClassifierTask {
 
             // Store insurance type in session
             context
-                .set(session_keys::INSURANCE_TYPE, insurance_type.clone())
-                .await;
+                .set(session_keys::INSURANCE_TYPE, insurance_type.clone())?;
 
             // Update claim details with insurance type
             let mut claim_details: ClaimDetails = context
                 .get(session_keys::CLAIM_DETAILS)
-                .await
                 .unwrap_or_default();
             claim_details.insurance_type = Some(insurance_type.clone());
             context
-                .set(session_keys::CLAIM_DETAILS, claim_details)
-                .await;
+                .set(session_keys::CLAIM_DETAILS, claim_details)?;
 
             let status_message = format!(
                 "Insurance type classified as: {} - proceeding to collect specific details",
@@ -118,7 +113,7 @@ impl Task for InsuranceTypeClassifierTask {
         }
 
         // If we couldn't determine the type, the response should be a clarifying question
-        context.add_assistant_message(response.clone()).await;
+        context.add_assistant_message(response.clone());
         let status_message =
             "Waiting for insurance type classification - need more information".to_string();
         Ok(TaskResult::new_with_status(

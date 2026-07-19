@@ -12,7 +12,6 @@ impl Task for HumanReviewTask {
 
         let document: MedicalDocument = context
             .get("document")
-            .await
             .ok_or_else(|| GraphError::ContextError("Document not found in context".to_string()))?;
 
         // Check if we have an initial summary to review
@@ -37,7 +36,7 @@ impl Task for HumanReviewTask {
         info!("Waiting for human review of initial summary");
 
         // Set the flag that the service looks for
-        context.set("waiting_for_human_feedback", true).await;
+        context.set("waiting_for_human_feedback", true)?;
 
         Ok(TaskResult::new_with_status(
             Some("Summary Ready, Waiting for Doctor Review".to_string()),

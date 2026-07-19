@@ -3,9 +3,14 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::{Context, error::Result, graph::Graph};
+use crate::{Context, error::{GraphError, Result}, graph::Graph};
 
 /// Session information
+///
+/// Sessions carry an optimistic-locking `version`: storage backends reject a
+/// save whose version does not match the stored one (see
+/// [`GraphError::SessionConflict`]), so concurrent runs of the same session
+/// fail loudly instead of silently losing updates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -14,13 +19,17 @@ pub struct Session {
     /// Optional status message from the last executed task
     pub status_message: Option<String>,
     pub context: crate::context::Context,
+    /// Optimistic-locking version, incremented by storage on every successful
+    /// save. Defaults to 0 for new / pre-0.6 sessions.
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl Session {
     /// Create a new session positioned at the given task.
     ///
-    /// Note: `graph_id` is set to `"default"`; assign it explicitly if you
-    /// store multiple graphs.
+    /// `graph_id` defaults to `"default"`; use [`Session::with_graph_id`] if
+    /// you store multiple graphs.
     pub fn new_from_task(sid: String, task_name: &str) -> Self {
         Self {
             id: sid,
@@ -28,7 +37,14 @@ impl Session {
             current_task_id: task_name.to_string(),
             status_message: None,
             context: Context::new(),
+            version: 0,
         }
+    }
+
+    /// Set the graph this session belongs to.
+    pub fn with_graph_id(mut self, graph_id: impl Into<String>) -> Self {
+        self.graph_id = graph_id.into();
+        self
     }
 }
 
@@ -40,7 +56,12 @@ pub trait GraphStorage: Send + Sync {
     async fn delete(&self, id: &str) -> Result<()>;
 }
 
-/// Trait for storing and retrieving sessions
+/// Trait for storing and retrieving sessions.
+///
+/// Implementations must enforce optimistic locking: `save` succeeds only when
+/// the incoming session's `version` matches the stored version (or the
+/// session does not exist yet), and increments the stored version on success.
+/// A mismatch returns [`GraphError::SessionConflict`].
 #[async_trait]
 pub trait SessionStorage: Send + Sync {
     async fn save(&self, session: Session) -> Result<()>;
@@ -105,8 +126,26 @@ impl InMemorySessionStorage {
 
 #[async_trait]
 impl SessionStorage for InMemorySessionStorage {
-    async fn save(&self, session: Session) -> Result<()> {
-        self.sessions.insert(session.id.clone(), session);
+    async fn save(&self, mut session: Session) -> Result<()> {
+        // Optimistic locking: the entry lock makes check-and-swap atomic.
+        match self.sessions.entry(session.id.clone()) {
+            dashmap::Entry::Occupied(mut occupied) => {
+                let stored_version = occupied.get().version;
+                if stored_version != session.version {
+                    return Err(GraphError::SessionConflict(format!(
+                        "Session '{}' was modified concurrently (stored version {}, \
+                         attempted save from version {})",
+                        session.id, stored_version, session.version
+                    )));
+                }
+                session.version += 1;
+                occupied.insert(session);
+            }
+            dashmap::Entry::Vacant(vacant) => {
+                session.version += 1;
+                vacant.insert(session);
+            }
+        }
         Ok(())
     }
 
@@ -117,5 +156,45 @@ impl SessionStorage for InMemorySessionStorage {
     async fn delete(&self, id: &str) -> Result<()> {
         self.sessions.remove(id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_session_version_conflict() {
+        let storage = InMemorySessionStorage::new();
+
+        let session = Session::new_from_task("s1".to_string(), "task");
+        storage.save(session).await.unwrap(); // stored version becomes 1
+
+        // Two clients load the same session (version 1)
+        let a = storage.get("s1").await.unwrap().unwrap();
+        let b = storage.get("s1").await.unwrap().unwrap();
+        assert_eq!(a.version, 1);
+
+        // First save wins...
+        storage.save(a).await.unwrap(); // stored version becomes 2
+
+        // ...second save conflicts
+        let err = storage.save(b).await.unwrap_err();
+        assert!(matches!(err, GraphError::SessionConflict(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_session_save_reload_cycle() {
+        let storage = InMemorySessionStorage::new();
+
+        let session = Session::new_from_task("s1".to_string(), "task");
+        storage.save(session).await.unwrap();
+
+        // Normal load -> save cycles keep working
+        for expected_version in 1..4 {
+            let s = storage.get("s1").await.unwrap().unwrap();
+            assert_eq!(s.version, expected_version);
+            storage.save(s).await.unwrap();
+        }
     }
 }

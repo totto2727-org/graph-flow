@@ -26,9 +26,10 @@ pub fn build_medical_workflow() -> Graph {
         .add_edge(&human_review_id, &summary_integration_id)
         .add_edge(&summary_integration_id, &research_search_id)
         .build()
+        .expect("medical workflow graph is invalid")
 }
 
-pub async fn create_medical_analysis_session(pdf_path: String) -> Session {
+pub async fn create_medical_analysis_session(pdf_path: String) -> graph_flow::Result<Session> {
     let document = MedicalDocument {
         id: Uuid::new_v4().to_string(),
         pdf_path,
@@ -47,9 +48,9 @@ pub async fn create_medical_analysis_session(pdf_path: String) -> Session {
     let pdf_extract_id = pdf_extract_task.id().to_string();
 
     let session = Session::new_from_task(session_id, &pdf_extract_id);
-    session.context.set("document", document).await;
+    session.context.set("document", document)?;
 
-    session
+    Ok(session)
 }
 
 pub fn create_flow_runner(session_storage: Arc<dyn SessionStorage>) -> FlowRunner {

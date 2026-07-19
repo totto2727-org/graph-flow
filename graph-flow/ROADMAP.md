@@ -1,102 +1,156 @@
 # graph-flow API Roadmap
 
-This document tracks **planned breaking changes** identified during the engine
-code review (2026-07). The review's non-breaking fixes shipped in `0.5.2`;
-everything below changes the public API and is deferred to the next
-semver-major (or `0.x+1`) release so it can land as one coordinated batch.
+This document tracked the **planned breaking changes** identified during the
+engine code review (2026-07). The review's non-breaking fixes shipped in
+`0.5.2`; **all ten breaking items below shipped in `0.6.0`**. A migration
+guide follows the item list.
 
-Status legend: 🔶 = mitigated in 0.5.2 (deprecation / additive API / docs), ⬜ = not started.
+Status legend: ✅ = shipped in 0.6.0.
 
-## 1. 🔶 Unify `Graph::execute` semantics (or remove it)
+## 1. ✅ Remove `Graph::execute`
 
-`Graph::execute` treats `NextAction` inconsistently with `execute_session`:
-`Continue` recurses into the next task (when there is no response) while
-`ContinueAndExecute` does nothing. `execute_session` implements the documented
-behavior.
+`Graph::execute` treated `NextAction` inconsistently with `execute_session`
+(`Continue` recursed, `ContinueAndExecute` did nothing). Deprecated in 0.5.2,
+removed in 0.6.0. Use `Graph::execute_session` or `FlowRunner::run`.
 
-- **0.5.2**: `Graph::execute` is `#[deprecated]` and now applies the task
-  timeout like `execute_session` does.
-- **Next major**: remove `Graph::execute` entirely, or reimplement it as a thin
-  session-less wrapper with the documented `NextAction` semantics.
+## 2. ✅ `Context::set` returns `Result`
 
-## 2. 🔶 `Context::set` should return `Result` instead of panicking
+`set` no longer panics on unserializable values; it returns
+`Err(GraphError::ContextError)`. The 0.5.2 `try_set` / `try_set_sync`
+stopgaps are removed.
 
-`set` / `set_sync` panic when the value cannot be serialized to JSON (e.g. a
-map with non-string keys).
+## 3. ✅ `Context` methods are synchronous
 
-- **0.5.2**: panic is documented; fallible `try_set` / `try_set_sync` added.
-- **Next major**: make `set` / `set_sync` return `Result<()>` and remove the
-  `try_*` variants.
+The context is an in-memory map guarded by short critical sections - nothing
+ever awaited. All `Context` methods (data and chat history) are now sync, and
+the redundant `get_sync` / `set_sync` duplicates are gone. Context calls work
+identically in async tasks and edge-condition closures.
 
-## 3. ⬜ Remove fake-async `Context` methods (or the `_sync` duplicates)
+## 4. ✅ Graph construction reports failure
 
-`Context::set`, `get`, `remove`, `clear` and all chat-history methods are
-`async` but never await; `get` and `get_sync` are identical. One of the two
-families should go:
+`GraphBuilder::build()` returns `Result<Graph>`: edges referencing unknown
+tasks fail with `GraphError::InvalidEdge`, and an unknown `set_start_task`
+target fails with `GraphError::TaskNotFound` (both were silent or
+warning-only before). `NextAction::GoTo` to a missing task remains a runtime
+error since the target is a runtime string.
 
-- Preferred: make the data methods sync (drop `async`), delete `get_sync` /
-  `set_sync`, and keep `async` only where a future implementation could
-  genuinely suspend.
-- This breaks every `.await` call site, so it must be a major release.
+## 5. ✅ Remove `ExecutionStatus::Error`
 
-## 4. ⬜ Builder/graph mutators should report failure
+The engine reports failures via `Err(GraphError)`; the never-constructed
+`Error(String)` variant is gone, so matches on `ExecutionStatus` no longer
+need a dead arm.
 
-`Graph::set_start_task` (and `GraphBuilder::set_start_task`) silently no-ops
-on an unknown task id (0.5.2 adds a `tracing::warn!`). `NextAction::GoTo` to a
-missing task only fails at runtime.
+## 6. ✅ Remove `NextAction::GoBack`
 
-- **Next major**: return `Result` from `set_start_task`, and make
-  `GraphBuilder::build()` return `Result<Graph>` so edge/task reference
-  validation (currently warnings) can be a hard error.
+Never implemented (behaved like `WaitForInput`). Deprecated in 0.5.2, removed
+in 0.6.0. Note: `NextAction` is serializable - persisted `TaskResult` values
+containing `GoBack` will fail to deserialize after upgrading.
 
-## 5. ⬜ Remove `ExecutionStatus::Error`
+## 7. ✅ `Graph` is immutable after `build()`
 
-The engine reports failures via `Err(GraphError)`; the `Error(String)` variant
-is never constructed, yet every consumer must match on it.
+`GraphBuilder` now owns all graph data (plain `HashMap`s, consuming builder
+methods) and `build()` produces an immutable `Graph` with no interior
+mutability - no `DashMap`, no `Mutex`, no lock poisoning, no per-lookup lock
+overhead. The mutating methods (`add_task`, `add_edge`,
+`add_conditional_edge`, `set_start_task`) exist only on the builder.
+`Graph::start_task_id()` now returns `Option<&str>`.
 
-- **Next major**: delete the variant (or start using it for recoverable task
-  errors - decide one way, not both).
+## 8. ✅ `ChatHistory` ring buffer
 
-## 6. 🔶 Remove `NextAction::GoBack`
+Messages are stored in a `VecDeque`: at the message cap, appending drops the
+oldest message in O(1) instead of shifting the whole buffer.
+`ChatHistory::messages()` and `last_messages(n)` now return iterators instead
+of slices. The serialized JSON format is unchanged (still an array), so
+persisted 0.5 sessions load fine.
 
-Never implemented - behaves like `WaitForInput`.
+## 9. ✅ Optimistic locking for session storage
 
-- **0.5.2**: `#[deprecated]`.
-- **Next major**: remove the variant. Note: it derives `Serialize`/
-  `Deserialize`, so check no persisted `TaskResult` values contain it before
-  removal.
+`Session` has a `version` field (serde-defaulted to 0 for pre-0.6 rows), and
+both storage backends enforce it: a save whose version doesn't match the
+stored session fails with the new `GraphError::SessionConflict` instead of
+silently overwriting newer data. `FlowRunner::run` therefore fails loudly if
+two runs of the same session race; retry the losing call to re-run against
+the fresh state.
 
-## 7. ⬜ Make `Graph` immutable after `build()`
+## 10. ✅ Session ids are free-form strings in Postgres
 
-`Graph` uses `DashMap`/`Mutex` interior mutability only so `GraphBuilder` can
-mutate through `&self`. After `build()` the graph is read-only.
+The `sessions.id` column is now `TEXT` instead of `UUID`, so human-readable
+session ids (e.g. `"session_001"`) work with `PostgresSessionStorage` just
+like with the in-memory backend. The migration converts existing tables in
+place. `Session::with_graph_id` replaces hand-writing struct literals when a
+session belongs to a non-default graph.
 
-- **Next major**: move the mutating methods (`add_task`, `add_edge`,
-  `add_conditional_edge`, `set_start_task`) onto `GraphBuilder` only; `Graph`
-  holds plain `HashMap`s with no locks. Removing `Graph`'s `pub` mutators is
-  the breaking part. (0.5.2 already indexes edges by source task, so the
-  performance motivation is mostly addressed.)
+---
 
-## 8. ⬜ `ChatHistory` ring-buffer storage
+# Migrating from 0.5 to 0.6
 
-At the message cap, every append shifts the whole `Vec` (O(n)). A `VecDeque`
-fixes this but `ChatHistory::messages() -> &[SerializableMessage]` cannot be
-kept as-is (a deque is not contiguous).
+## Context calls: drop `.await`, handle `Result` on `set`
 
-- **Next major**: switch to `VecDeque` and change `messages()` to return an
-  iterator (or `(&[..], &[..])` slices), or accept `&mut self` for
-  `make_contiguous`.
+```rust
+// 0.5
+let name: String = context.get("name").await.unwrap_or_default();
+let flag = ctx.get_sync::<bool>("flag").unwrap_or(false);
+context.set("greeting", greeting.clone()).await;
+context.add_user_message(input).await;
+let history = context.get_rig_messages().await;
 
-## 9. ⬜ Optimistic locking for `PostgresSessionStorage`
+// 0.6
+let name: String = context.get("name").unwrap_or_default();
+let flag = ctx.get::<bool>("flag").unwrap_or(false);
+context.set("greeting", greeting.clone())?;   // now fallible
+context.add_user_message(input);
+let history = context.get_rig_messages();
+```
 
-Saves are last-write-wins; concurrent runs of the same session lose updates
-(0.5.2 documents this on `FlowRunner::run` and the storage type). Real
-protection needs a `version` column checked on update and a new error variant
-(e.g. `GraphError::SessionConflict`) - a schema and behavior change.
+In functions that don't return `Result`, handle `set` explicitly
+(`.expect(...)` or `let _ = ...` if the value is known-serializable).
 
-## 10. ⬜ Type `Session::id` (UUID requirement)
+## Graph building: `build()` returns `Result<Graph>`
 
-`Session::id` is a free-form `String`, but the Postgres schema casts it to
-`UUID`, so non-UUID ids fail at runtime (documented in 0.5.2). Either type the
-field as `uuid::Uuid` (breaking) or change the column to `TEXT` (migration).
-Also reconsider `Session::new_from_task` hardcoding `graph_id = "default"`.
+```rust
+// 0.5
+let graph = GraphBuilder::new("wf").add_task(t).build();
+
+// 0.6
+let graph = GraphBuilder::new("wf").add_task(t).build()?;
+```
+
+## `ExecutionStatus` matches: delete the `Error` arm
+
+```rust
+match result.status {
+    ExecutionStatus::Completed => { ... }
+    ExecutionStatus::Paused { .. } => { ... }
+    ExecutionStatus::WaitingForInput => { ... }
+    // ExecutionStatus::Error(e) arm no longer exists - errors arrive as Err(GraphError)
+}
+```
+
+## Session literals: use the constructor (new `version` field)
+
+```rust
+// 0.5
+let session = Session { id, graph_id, current_task_id, status_message: None, context };
+
+// 0.6
+let mut session = Session::new_from_task(id, &task_id).with_graph_id(graph_id);
+session.context = context; // if you built a custom context
+```
+
+## Handle `GraphError::SessionConflict`
+
+If your service can run the same session concurrently, treat
+`SessionConflict` from `save` / `FlowRunner::run` as "reload and retry".
+Single-writer services will never see it.
+
+## Removed items and their replacements
+
+| Removed | Use instead |
+|---|---|
+| `Graph::execute` | `Graph::execute_session` / `FlowRunner::run` |
+| `NextAction::GoBack` | `NextAction::GoTo(task_id)` |
+| `ExecutionStatus::Error` | `Err(GraphError)` from the execution call |
+| `Context::get_sync` / `set_sync` | `Context::get` / `set` (now sync) |
+| `Context::try_set` / `try_set_sync` | `Context::set` (now fallible) |
+| `Graph::add_task` / `add_edge` / `add_conditional_edge` / `set_start_task` | the same methods on `GraphBuilder` |
+| `ChatHistory::messages()` slice indexing | iterate (`.messages()`, `.last_messages(n)`) or collect |

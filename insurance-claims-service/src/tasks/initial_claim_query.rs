@@ -24,7 +24,7 @@ pub struct InitialClaimQueryTask;
 #[async_trait]
 impl Task for InitialClaimQueryTask {
     async fn run(&self, context: Context) -> Result<TaskResult> {
-        let session_id = context.get::<String>("session_id").await.unwrap_or_else(|| "unknown".to_string());
+        let session_id = context.get::<String>("session_id").unwrap_or_else(|| "unknown".to_string());
         
         info!(
             session_id = %session_id,
@@ -34,7 +34,6 @@ impl Task for InitialClaimQueryTask {
         
         let user_input: String = context
             .get(session_keys::USER_INPUT)
-            .await
             .ok_or_else(|| GraphError::ContextError("user_input not found".to_string()))?;
 
         info!(
@@ -52,12 +51,11 @@ impl Task for InitialClaimQueryTask {
         // Initialize claim details in context
         let claim_details = ClaimDetails::default();
         context
-            .set(session_keys::CLAIM_DETAILS, claim_details)
-            .await;
+            .set(session_keys::CLAIM_DETAILS, claim_details)?;
 
         // Add user message and assistant response to chat history
-        context.add_user_message(user_input.clone()).await;
-        context.add_assistant_message(response.clone()).await;
+        context.add_user_message(user_input.clone());
+        context.add_assistant_message(response.clone());
 
         Ok(TaskResult::new_with_status(
             Some(response),

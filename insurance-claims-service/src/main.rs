@@ -143,8 +143,7 @@ async fn main() {
 
     // Get the graph for FlowRunner creation
     let graph = graph_storage
-        .get("default")
-        .await
+        .get("default").await
         .expect("Failed to get graph")
         .expect("Graph not found");
 
@@ -232,9 +231,12 @@ async fn execute_graph(
     session
         .context
         .set(session_keys::USER_INPUT, request.content)
-        .await;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    session.context.set("session_id", session_id.clone()).await;
+    session
+        .context
+        .set("session_id", session_id.clone())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Save the session with updated context before execution
     if let Err(e) = state.session_storage.save(session).await {
@@ -320,6 +322,7 @@ async fn get_session(
 }
 
 fn create_default_graph() -> Graph {
+    // Graph shape is static; a build failure here is a programming error.
     use crate::tasks::session_keys;
 
     let mut builder = GraphBuilder::new("simplified_insurance_claims");
@@ -357,7 +360,7 @@ fn create_default_graph() -> Graph {
         classifier_id.clone(),
         |context| {
             context
-                .get_sync::<String>(session_keys::INSURANCE_TYPE)
+                .get::<String>(session_keys::INSURANCE_TYPE)
                 .map(|t| t == "car")
                 .unwrap_or(false)
         },
@@ -373,5 +376,5 @@ fn create_default_graph() -> Graph {
     // Smart validator flows to final summary
     builder = builder.add_edge(smart_validator_id, final_summary_id);
 
-    builder.build()
+    builder.build().expect("insurance claims graph is invalid")
 }

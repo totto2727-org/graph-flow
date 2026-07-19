@@ -6,7 +6,8 @@
 //!
 //! - **Type-Safe Workflows**: Compile-time guarantees for workflow correctness
 //! - **Flexible Execution**: Step-by-step, batch, or mixed execution modes
-//! - **Built-in Persistence**: PostgreSQL and in-memory storage backends
+//! - **Built-in Persistence**: PostgreSQL and in-memory storage backends with
+//!   optimistic locking
 //! - **LLM Integration**: Optional integration with Rig for AI agent capabilities
 //! - **Human-in-the-Loop**: Natural workflow interruption and resumption
 //! - **Async/Await Native**: Built from the ground up for async Rust
@@ -28,10 +29,10 @@
 //!     }
 //!
 //!     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-//!         let name: String = context.get("name").await.unwrap_or("World".to_string());
+//!         let name: String = context.get("name").unwrap_or("World".to_string());
 //!         let greeting = format!("Hello, {}!", name);
-//!         
-//!         context.set("greeting", greeting.clone()).await;
+//!
+//!         context.set("greeting", greeting.clone())?;
 //!         Ok(TaskResult::new(Some(greeting), NextAction::Continue))
 //!     }
 //! }
@@ -43,7 +44,7 @@
 //! let graph = Arc::new(
 //!     GraphBuilder::new("greeting_workflow")
 //!         .add_task(hello_task.clone())
-//!         .build()
+//!         .build()?
 //! );
 //!
 //! // Set up session storage and runner
@@ -52,7 +53,7 @@
 //!
 //! // Create and execute session
 //! let session = Session::new_from_task("user_123".to_string(), hello_task.id());
-//! session.context.set("name", "Alice".to_string()).await;
+//! session.context.set("name", "Alice".to_string())?;
 //! session_storage.save(session).await?;
 //!
 //! let result = flow_runner.run("user_123").await?;
@@ -88,27 +89,31 @@
 //!
 //! ### Context
 //!
-//! The [`Context`] provides thread-safe state management across your workflow:
+//! The [`Context`] provides thread-safe state management across your workflow.
+//! Its methods are synchronous, so they work both in async tasks and in
+//! edge-condition closures:
 //!
 //! ```rust
 //! # use graph_flow::Context;
-//! # #[tokio::main]
-//! # async fn main() {
+//! # fn main() -> graph_flow::Result<()> {
 //! let context = Context::new();
 //!
 //! // Store and retrieve data
-//! context.set("key", "value").await;
-//! let value: Option<String> = context.get("key").await;
+//! context.set("key", "value")?;
+//! let value: Option<String> = context.get("key");
 //!
 //! // Chat history management
-//! context.add_user_message("Hello!".to_string()).await;
-//! context.add_assistant_message("Hi there!".to_string()).await;
+//! context.add_user_message("Hello!".to_string());
+//! context.add_assistant_message("Hi there!".to_string());
+//! # Ok(())
 //! # }
 //! ```
 //!
 //! ### Graph Building
 //!
-//! Use [`GraphBuilder`] to create complex workflows:
+//! Use [`GraphBuilder`] to create workflows. [`GraphBuilder::build`] validates
+//! the graph (edge endpoints and the start task must exist) and returns an
+//! immutable [`Graph`]:
 //!
 //! ```rust
 //! # use graph_flow::{GraphBuilder, Task, TaskResult, NextAction, Context};
@@ -118,6 +123,7 @@
 //! # #[async_trait] impl Task for Task1 { fn id(&self) -> &str { "task1" } async fn run(&self, _: Context) -> graph_flow::Result<TaskResult> { Ok(TaskResult::new(None, NextAction::End)) } }
 //! # #[async_trait] impl Task for Task2 { fn id(&self) -> &str { "task2" } async fn run(&self, _: Context) -> graph_flow::Result<TaskResult> { Ok(TaskResult::new(None, NextAction::End)) } }
 //! # #[async_trait] impl Task for Task3 { fn id(&self) -> &str { "task3" } async fn run(&self, _: Context) -> graph_flow::Result<TaskResult> { Ok(TaskResult::new(None, NextAction::End)) } }
+//! # fn main() -> graph_flow::Result<()> {
 //! # let task1 = Arc::new(Task1); let task2 = Arc::new(Task2); let task3 = Arc::new(Task3);
 //! let graph = GraphBuilder::new("my_workflow")
 //!     .add_task(task1.clone())
@@ -126,11 +132,13 @@
 //!     .add_edge(task1.id(), task2.id())
 //!     .add_conditional_edge(
 //!         task2.id(),
-//!         |ctx| ctx.get_sync::<bool>("condition").unwrap_or(false),
+//!         |ctx| ctx.get::<bool>("condition").unwrap_or(false),
 //!         task3.id(),    // if true
 //!         task1.id(),    // if false
 //!     )
-//!     .build();
+//!     .build()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ### Execution
@@ -204,8 +212,8 @@ mod tests {
         }
 
         async fn run(&self, context: Context) -> Result<TaskResult> {
-            let input: String = context.get("input").await.unwrap_or_default();
-            context.set("output", format!("Processed: {}", input)).await;
+            let input: String = context.get("input").unwrap_or_default();
+            context.set("output", format!("Processed: {}", input))?;
 
             Ok(TaskResult::new(
                 Some("Task completed".to_string()),
@@ -215,24 +223,54 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // exercises the deprecated Graph::execute until it is removed
     async fn test_simple_graph_execution() {
         let task = Arc::new(TestTask {
             id: "test_task".to_string(),
         });
 
-        let graph = GraphBuilder::new("test_graph").add_task(task).build();
+        let graph = GraphBuilder::new("test_graph")
+            .add_task(task)
+            .build()
+            .unwrap();
 
-        let context = Context::new();
-        context.set("input", "Hello, World!").await;
+        let mut session = Session::new_from_task("s1".to_string(), "test_task");
+        session.context.set("input", "Hello, World!").unwrap();
 
-        let result = graph.execute("test_task", context.clone()).await.unwrap();
+        let result = graph.execute_session(&mut session).await.unwrap();
 
         assert!(result.response.is_some());
-        assert!(matches!(result.next_action, NextAction::End));
+        assert!(matches!(result.status, ExecutionStatus::Completed));
 
-        let output: String = context.get("output").await.unwrap();
+        let output: String = session.context.get("output").unwrap();
         assert_eq!(output, "Processed: Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn test_build_rejects_dangling_edge() {
+        let task = Arc::new(TestTask {
+            id: "only_task".to_string(),
+        });
+
+        let result = GraphBuilder::new("bad_graph")
+            .add_task(task)
+            .add_edge("only_task", "missing_task")
+            .build();
+
+        assert!(matches!(result, Err(GraphError::InvalidEdge(_))));
+    }
+
+    #[tokio::test]
+    async fn test_build_rejects_unknown_start_task() {
+        let task = Arc::new(TestTask {
+            id: "only_task".to_string(),
+        });
+
+        let result = GraphBuilder::new("bad_graph")
+            .add_task(task)
+            .set_start_task("missing_task")
+            .build();
+
+        assert!(matches!(result, Err(GraphError::TaskNotFound(_))));
     }
 
     #[tokio::test]
@@ -249,16 +287,12 @@ mod tests {
         let retrieved = graph_storage.get("test").await.unwrap();
         assert!(retrieved.is_some());
 
-        let session = Session {
-            id: "session1".to_string(),
-            graph_id: "test".to_string(),
-            current_task_id: "task1".to_string(),
-            status_message: None,
-            context: Context::new(),
-        };
+        let session =
+            Session::new_from_task("session1".to_string(), "task1").with_graph_id("test");
 
-        session_storage.save(session.clone()).await.unwrap();
+        session_storage.save(session).await.unwrap();
         let retrieved_session = session_storage.get("session1").await.unwrap();
         assert!(retrieved_session.is_some());
+        assert_eq!(retrieved_session.unwrap().graph_id, "test");
     }
 }

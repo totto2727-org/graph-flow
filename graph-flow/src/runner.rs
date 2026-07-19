@@ -284,11 +284,14 @@ impl FlowRunner {
     ///
     /// # Concurrency
     ///
-    /// This is a load → execute → save cycle with no locking: two concurrent
-    /// `run` calls for the *same* session id race, and the later save wins
-    /// (lost update). Serialize requests per session (e.g. per-session mutex,
-    /// sticky routing, or a queue) if your service can receive concurrent
-    /// requests for one session.
+    /// Sessions are protected by optimistic locking: if another `run` call (or
+    /// any other writer) saved the same session between this call's load and
+    /// save, the save fails with [`crate::GraphError::SessionConflict`]
+    /// instead of silently losing the other writer's update. On conflict,
+    /// retry by calling `run` again (it reloads the latest session state).
+    /// Note that the *task's* side effects from the conflicting attempt are
+    /// not rolled back, so tasks should be idempotent if concurrent runs are
+    /// possible.
     ///
     /// # Examples
     ///
@@ -315,9 +318,6 @@ impl FlowRunner {
     ///     }
     ///     graph_flow::ExecutionStatus::Paused { next_task_id, reason } => {
     ///         println!("Paused, next task: {}, reason: {}", next_task_id, reason);
-    ///     }
-    ///     graph_flow::ExecutionStatus::Error(e) => {
-    ///         eprintln!("Error: {}", e);
     ///     }
     /// }
     /// # Ok(())
@@ -348,10 +348,6 @@ impl FlowRunner {
     ///         ExecutionStatus::Paused { .. } => {
     ///             // Continue to next step
     ///             continue;
-    ///         }
-    ///         ExecutionStatus::Error(e) => {
-    ///             eprintln!("Error: {}", e);
-    ///             break;
     ///         }
     ///     }
     /// }

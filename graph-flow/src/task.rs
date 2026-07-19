@@ -20,11 +20,11 @@
 //!     }
 //!
 //!     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-//!         let name: String = context.get("name").await.unwrap_or("World".to_string());
+//!         let name: String = context.get("name").unwrap_or("World".to_string());
 //!         let greeting = format!("Hello, {}!", name);
 //!         
 //!         // Store result for next task
-//!         context.set("greeting", greeting.clone()).await;
+//!         context.set("greeting", greeting.clone())?;
 //!         
 //!         Ok(TaskResult::new(Some(greeting), NextAction::Continue))
 //!     }
@@ -45,12 +45,12 @@
 //!     }
 //!
 //!     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-//!         let user_input: Option<String> = context.get("user_input").await;
+//!         let user_input: Option<String> = context.get("user_input");
 //!         
 //!         match user_input {
 //!             Some(input) if !input.is_empty() => {
 //!                 // Process input and continue automatically
-//!                 context.set("processed", input.to_uppercase()).await;
+//!                 context.set("processed", input.to_uppercase())?;
 //!                 Ok(TaskResult::new(
 //!                     Some("Input processed".to_string()),
 //!                     NextAction::ContinueAndExecute
@@ -281,17 +281,6 @@ pub enum NextAction {
     /// ```
     GoTo(String),
 
-    /// Go back to the previous task.
-    ///
-    /// Note: This was never implemented - it behaves like `WaitForInput`
-    /// (stays at the current task). It will be removed in a future release.
-    #[deprecated(
-        since = "0.5.2",
-        note = "GoBack is not implemented (it behaves like WaitForInput) and will be removed; \
-                use NextAction::GoTo(task_id) for explicit navigation"
-    )]
-    GoBack,
-
     /// End the graph execution.
     ///
     /// Terminates the workflow completely. No further tasks will be executed.
@@ -330,7 +319,7 @@ pub enum NextAction {
 ///     }
 ///
 ///     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-///         let name: String = context.get("name").await.unwrap_or("World".to_string());
+///         let name: String = context.get("name").unwrap_or("World".to_string());
 ///         let greeting = format!("Hello, {}!", name);
 ///         
 ///         Ok(TaskResult::new(Some(greeting), NextAction::Continue))
@@ -371,19 +360,19 @@ pub enum NextAction {
 ///     }
 ///
 ///     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
-///         let data: Option<String> = context.get("data").await;
-///         let retry_count: usize = context.get("retry_count").await.unwrap_or(0);
+///         let data: Option<String> = context.get("data");
+///         let retry_count: usize = context.get("retry_count").unwrap_or(0);
 ///         
 ///         match data {
 ///             Some(data) if self.validate(&data) => {
-///                 context.set("retry_count", 0).await; // Reset counter
+///                 context.set("retry_count", 0)?; // Reset counter
 ///                 Ok(TaskResult::new(
 ///                     Some("Validation passed".to_string()),
 ///                     NextAction::Continue
 ///                 ))
 ///             }
 ///             Some(_) if retry_count < self.max_retries => {
-///                 context.set("retry_count", retry_count + 1).await;
+///                 context.set("retry_count", retry_count + 1)?;
 ///                 Ok(TaskResult::new(
 ///                     Some("Validation failed, retrying...".to_string()),
 ///                     NextAction::GoTo("data_input".to_string())
@@ -476,14 +465,13 @@ pub trait Task: Send + Sync {
     ///
     ///     async fn run(&self, context: Context) -> graph_flow::Result<TaskResult> {
     ///         // Read input from context
-    ///         let input: String = context.get("raw_data").await
-    ///             .unwrap_or_default();
+    ///         let input: String = context.get("raw_data").unwrap_or_default();
     ///         
     ///         // Process the data
     ///         let processed = self.process_data(&input).await?;
     ///         
     ///         // Store result for next task
-    ///         context.set("processed_data", processed.clone()).await;
+    ///         context.set("processed_data", processed.clone())?;
     ///         
     ///         // Return result with next action
     ///         Ok(TaskResult::new(

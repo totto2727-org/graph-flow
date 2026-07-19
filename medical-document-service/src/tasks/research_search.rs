@@ -17,7 +17,6 @@ impl Task for ResearchSearchTask {
 
         let document: MedicalDocument = context
             .get("document")
-            .await
             .ok_or_else(|| GraphError::ContextError("Document not found in context".to_string()))?;
 
         let integrated_summary = document
@@ -73,7 +72,7 @@ impl Task for ResearchSearchTask {
         updated_document.research_keywords = Some(search_queries);
         //updated_document.research_articles = Some(research_articles);
         updated_document.research_summary = Some(research_summary.clone());
-        context.set("document", updated_document).await;
+        context.set("document", updated_document)?;
 
         info!("Medical research search completed");
 

@@ -23,6 +23,11 @@ pub enum GraphError {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
+    /// A save was rejected because the stored session changed since it was
+    /// loaded (optimistic-locking conflict). Reload the session and retry.
+    #[error("Session conflict: {0}")]
+    SessionConflict(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

@@ -35,7 +35,7 @@ impl Task for VectorSearchTask {
         info!("Starting vector search task");
 
         let refined_query: String = context
-            .get_sync("refined_query")
+            .get("refined_query")
             .ok_or_else(|| TaskExecutionFailed("refined_query not found in context".into()))?;
 
         info!("Searching for: {}", refined_query);
@@ -76,8 +76,7 @@ impl Task for VectorSearchTask {
             .join("\n---\n");
 
         context
-            .set("retrieved_context", context_block.clone())
-            .await;
+            .set("retrieved_context", context_block.clone())?;
         info!("Vector search completed successfully");
 
         Ok(TaskResult::new(None, NextAction::ContinueAndExecute))

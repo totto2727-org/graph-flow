@@ -36,7 +36,7 @@
 //! impl Task for ChildA {
 //!     fn id(&self) -> &str { "child_a" }
 //!     async fn run(&self, ctx: Context) -> graph_flow::Result<TaskResult> {
-//!         ctx.set("a", 1_i32).await;
+//!         ctx.set("a", 1_i32)?;
 //!         Ok(TaskResult::new(Some("A done".to_string()), NextAction::End))
 //!     }
 //! }
@@ -45,7 +45,7 @@
 //! impl Task for ChildB {
 //!     fn id(&self) -> &str { "child_b" }
 //!     async fn run(&self, ctx: Context) -> graph_flow::Result<TaskResult> {
-//!         ctx.set("b", 2_i32).await;
+//!         ctx.set("b", 2_i32)?;
 //!         Ok(TaskResult::new(Some("B done".to_string()), NextAction::End))
 //!     }
 //! }
@@ -163,15 +163,14 @@ impl Task for FanOutTask {
                             ..
                         } = tr;
                         if let Some(resp) = response {
-                            context.set(self.key(&child_id, "response"), resp).await;
+                            context.set(self.key(&child_id, "response"), resp)?;
                         }
                         if let Some(status) = status_message {
-                            context.set(self.key(&child_id, "status"), status).await;
+                            context.set(self.key(&child_id, "status"), status)?;
                         }
                         // Always store the reported next_action for diagnostics
                         context
-                            .set(self.key(&child_id, "next_action"), format!("{:?}", next_action))
-                            .await;
+                            .set(self.key(&child_id, "next_action"), format!("{:?}", next_action))?;
                         completed += 1;
                     }
                 },
@@ -208,7 +207,7 @@ mod tests {
     impl Task for OkTask {
         fn id(&self) -> &str { self.name }
         async fn run(&self, ctx: Context) -> Result<TaskResult> {
-            ctx.set(format!("out.{}", self.name), true).await;
+            ctx.set(format!("out.{}", self.name), true)?;
             sleep(Duration::from_millis(10)).await;
             Ok(TaskResult::new(Some(format!("{} ok", self.name)), NextAction::End))
         }
@@ -233,13 +232,13 @@ mod tests {
 
         assert_eq!(res.next_action, NextAction::Continue);
 
-        let ar: Option<String> = ctx.get("agg.a.response").await;
-        let br: Option<String> = ctx.get("agg.b.response").await;
+        let ar: Option<String> = ctx.get("agg.a.response");
+        let br: Option<String> = ctx.get("agg.b.response");
         assert_eq!(ar, Some("a ok".to_string()));
         assert_eq!(br, Some("b ok".to_string()));
 
         // also store next_action diagnostic
-        let an: Option<String> = ctx.get("agg.a.next_action").await;
+        let an: Option<String> = ctx.get("agg.a.next_action");
         assert_eq!(an, Some(format!("{:?}", NextAction::End)));
     }
 

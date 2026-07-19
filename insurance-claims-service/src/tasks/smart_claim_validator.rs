@@ -13,7 +13,7 @@ pub struct SmartClaimValidatorTask;
 impl Task for SmartClaimValidatorTask {
 
     async fn run(&self, context: Context) -> Result<TaskResult> {
-        let session_id = context.get::<String>("session_id").await.unwrap_or_else(|| "unknown".to_string());
+        let session_id = context.get::<String>("session_id").unwrap_or_else(|| "unknown".to_string());
         
         info!(
             session_id = %session_id,
@@ -23,14 +23,12 @@ impl Task for SmartClaimValidatorTask {
 
         // Check if we're waiting for approval
         let approval_state: Option<String> = context
-            .get(session_keys::APPROVAL_STATE)
-            .await;
+            .get(session_keys::APPROVAL_STATE);
 
         if let Some("pending") = approval_state.as_deref() {
             // We're waiting for approval, process the user input
             let user_input: String = context
                 .get(session_keys::USER_INPUT)
-                .await
                 .ok_or_else(|| GraphError::ContextError("user_input not found".to_string()))?;
             
             info!(
@@ -45,7 +43,6 @@ impl Task for SmartClaimValidatorTask {
         // Get claim details
         let claim_details: ClaimDetails = context
             .get(session_keys::CLAIM_DETAILS)
-            .await
             .ok_or_else(|| GraphError::ContextError("claim_details not found".to_string()))?;
 
         let claim_amount = claim_details.estimated_cost.unwrap_or(0.0);
@@ -66,7 +63,7 @@ impl Task for SmartClaimValidatorTask {
                 timestamp: chrono::Utc::now().to_rfc3339(),
             };
 
-            context.set(session_keys::CLAIM_DECISION, decision).await;
+            context.set(session_keys::CLAIM_DECISION, decision)?;
 
             let status_message = format!(
                 "Claim auto-approved - Amount: ${:.2} (under $1000) - proceeding to final summary",
@@ -89,7 +86,7 @@ impl Task for SmartClaimValidatorTask {
             ))
         } else {
             // Requires manual approval for amounts $1000 and above
-            context.set(session_keys::APPROVAL_STATE, "pending".to_string()).await;
+            context.set(session_keys::APPROVAL_STATE, "pending".to_string())?;
 
             let insurance_type = claim_details.insurance_type.as_deref().unwrap_or("insurance");
             
@@ -134,8 +131,8 @@ impl SmartClaimValidatorTask {
                 timestamp: chrono::Utc::now().to_rfc3339(),
             };
 
-            context.set(session_keys::CLAIM_DECISION, decision).await;
-            context.set(session_keys::APPROVAL_STATE, "completed".to_string()).await;
+            context.set(session_keys::CLAIM_DECISION, decision)?;
+            context.set(session_keys::APPROVAL_STATE, "completed".to_string())?;
 
             let status_message = "Manual approval received - proceeding to final summary".to_string();
             info!("{}", status_message);

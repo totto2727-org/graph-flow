@@ -62,7 +62,7 @@ impl Task for QueryRefinementTask {
         info!("Starting query refinement task");
 
         let user_query: String = context
-            .get_sync("user_query")
+            .get("user_query")
             .ok_or_else(|| TaskExecutionFailed("user_query not found in context".into()))?;
 
         info!("Original user query: {}", user_query);
@@ -86,10 +86,10 @@ impl Task for QueryRefinementTask {
             .to_string();
 
         info!("Refined query: {}", refined);
-        context.set("refined_query", refined.clone()).await;
+        context.set("refined_query", refined.clone())?;
 
         // Initialize retry count
-        context.set("retry_count", 0u32).await;
+        context.set("retry_count", 0u32)?;
 
         Ok(TaskResult::new(None, NextAction::Continue))
     }
@@ -121,7 +121,7 @@ impl Task for VectorSearchTask {
         info!("Starting vector search task");
 
         let refined_query: String = context
-            .get_sync("refined_query")
+            .get("refined_query")
             .ok_or_else(|| TaskExecutionFailed("refined_query not found in context".into()))?;
 
         info!("Searching for: {}", refined_query);
@@ -162,8 +162,7 @@ impl Task for VectorSearchTask {
             .join("\n---\n");
 
         context
-            .set("retrieved_context", context_block.clone())
-            .await;
+            .set("retrieved_context", context_block.clone())?;
         info!("Vector search completed successfully");
 
         Ok(TaskResult::new(None, NextAction::Continue))
@@ -181,15 +180,15 @@ impl Task for AnswerGenerationTask {
         info!("Starting answer generation task");
 
         let user_query: String = context
-            .get_sync("user_query")
+            .get("user_query")
             .ok_or_else(|| TaskExecutionFailed("user_query not found in context".into()))?;
 
         let ctx: String = context
-            .get_sync("retrieved_context")
+            .get("retrieved_context")
             .ok_or_else(|| TaskExecutionFailed("retrieved_context not found in context".into()))?;
 
         let retry_count: u32 = context
-            .get_sync("retry_count")
+            .get("retry_count")
             .ok_or_else(|| TaskExecutionFailed("retry_count not found in context".into()))?;
 
         info!(
@@ -199,7 +198,7 @@ impl Task for AnswerGenerationTask {
         );
 
         // Get the full chat history for conversational memory
-        let history = context.get_rig_messages().await;
+        let history = context.get_rig_messages();
 
         let agent = get_llm_agent()
             .map_err(|e| TaskExecutionFailed(format!("Failed to initialize LLM agent: {}", e)))?;
@@ -238,11 +237,10 @@ impl Task for AnswerGenerationTask {
         info!("Answer generated: {}", answer);
 
         // Add the current answer attempt to chat history
-        context.add_user_message(prompt).await;
+        context.add_user_message(prompt);
         context
-            .add_assistant_message(format!("Attempt {}: {}", retry_count + 1, answer))
-            .await;
-        context.set("answer", answer.clone()).await;
+            .add_assistant_message(format!("Attempt {}: {}", retry_count + 1, answer));
+        context.set("answer", answer.clone())?;
 
         Ok(TaskResult::new(Some(answer), NextAction::Continue))
     }
@@ -265,15 +263,15 @@ impl Task for ValidationTask {
         info!("Starting validation task");
 
         let answer: String = context
-            .get_sync("answer")
+            .get("answer")
             .ok_or_else(|| TaskExecutionFailed("answer not found in context".into()))?;
 
         let user_query: String = context
-            .get_sync("user_query")
+            .get("user_query")
             .ok_or_else(|| TaskExecutionFailed("user_query not found in context".into()))?;
 
         let retry_count: u32 = context
-            .get_sync("retry_count")
+            .get("retry_count")
             .ok_or_else(|| TaskExecutionFailed("retry_count not found in context".into()))?;
 
         info!(
@@ -323,8 +321,7 @@ impl Task for ValidationTask {
             })?;
 
         context
-            .set("validation_passed", &validation_result.passed)
-            .await;
+            .set("validation_passed", &validation_result.passed)?;
         if validation_result.passed {
             info!("Validation passed");
             return Ok(TaskResult::new(None, NextAction::Continue));
@@ -350,10 +347,10 @@ impl Task for ValidationTask {
         // we still have another chance to try
         // add the comment to the chat history with a explanation of what went wrong
         let validation_message = format!("The answer is not good enough. Reason: {}", comment);
-        context.add_user_message(validation_message).await;
+        context.add_user_message(validation_message);
 
         // Increment retry count for the next attempt
-        context.set("retry_count", retry_count + 1).await;
+        context.set("retry_count", retry_count + 1)?;
         Ok(TaskResult::new(None, NextAction::Continue))
     }
 }
@@ -369,11 +366,11 @@ impl Task for DeliveryTask {
         info!("Starting delivery task");
 
         let answer: String = context
-            .get_sync("answer")
+            .get("answer")
             .ok_or_else(|| TaskExecutionFailed("answer not found in context".into()))?;
 
         let retry_count: u32 = context
-            .get_sync("retry_count")
+            .get("retry_count")
             .ok_or_else(|| TaskExecutionFailed("retry_count not found in context".into()))?;
 
         info!("Delivering final answer after {} retries", retry_count);
@@ -439,11 +436,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Conditional routing: if validation passes go to delivery, else back to answer generation
             .add_conditional_edge(
                 validate_id.clone(),
-                |ctx| ctx.get_sync::<bool>("validation_passed").unwrap_or(false),
+                |ctx| ctx.get::<bool>("validation_passed").unwrap_or(false),
                 deliver_id.clone(),
                 answer_id.clone(), // Changed from search_id to answer_id for proper feedback loop
             )
-            .build(),
+            .build()?,
     );
 
     graph_storage
@@ -455,7 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Session --------------------------------------------------------------------------
     let session_id = Uuid::new_v4().to_string();
     let session = Session::new_from_task(session_id.clone(), &refine_id);
-    session.context.set("user_query", user_query.clone()).await;
+    session.context.set("user_query", user_query.clone())?;
     session_storage.save(session.clone()).await?;
 
     info!(
@@ -481,10 +478,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExecutionStatus::WaitingForInput => {
                 info!("Workflow waiting for user input, continuing...");
                 continue;
-            }
-            ExecutionStatus::Error(e) => {
-                error!("Workflow error: {}", e);
-                return Err(e.into());
             }
         }
     }
